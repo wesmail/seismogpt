@@ -1,12 +1,8 @@
 # Generic imports
-import math
-import h5py
 import functools
 import numpy as np
 from pathlib import Path
-from scipy import signal
 import scipy.signal as scipy_signal
-import os
 import random
 import logging
 
@@ -33,144 +29,104 @@ try:
 except ImportError:
     sbd = None
 
-import numpy as np
-from pathlib import Path
-import scipy.signal as scipy_signal
-import logging
-
-import torch
-from torch.utils.data import Dataset
-
-try:
-    import seisbench.data as sbd
-except ImportError:
-    sbd = None
-
 log = logging.getLogger(__name__)
 
 # --------------------------------------------------------------------------------------
 # Collate function for waveform batches
 # --------------------------------------------------------------------------------------
-def waveform_collate_fn(batch, num_tokens: int, min_tokens: int = 24, bias_high_tokens: bool = True, kernel_size: int = 16):
+def waveform_collate_fn(batch, num_tokens: int, min_tokens: int = 24,
+                        bias_high_tokens: bool = True):
     """
-    Custom collate function for waveform batches without station dimension.
+    Collate function for variable-length waveform token batches (no padding).
 
-    This function ensures all samples in a batch share the same number of valid tokens.
-    It randomly selects a `real_tokens` count between `min_tokens` and `num_tokens`,
-    pads the remaining tokens in each sample with zeros, and constructs a mask indicating
-    which tokens are padded (1 = pad, 0 = valid). This mask is useful for attention mechanisms
-    and loss functions that should ignore padded regions.
+    This function constructs a batch where all samples share the same number of
+    valid tokens `real_tokens`, but *without zero-padding*. Instead, each sample
+    is truncated to `real_tokens` along the token axis. This avoids padded tokens
+    entering the transformer and eliminates the need for attention masking,
+    preserving compatibility with Flash Attention (no explicit attn_mask).
+
+    A single `real_tokens` value is sampled per batch in the range
+    [min_tokens, num_tokens]. If `bias_high_tokens=True`, longer contexts are
+    sampled with linearly increasing probability, encouraging the model to
+    train more frequently on longer sequences while still seeing shorter ones.
 
     Args:
-        batch (list of dict): Each dict has keys "x", "y", "padding_mask".
-        num_tokens (int): Total number of tokens per sample.
-        min_tokens (int): Minimum number of valid (unpadded) tokens.
-        bias_high_tokens (bool): If True, sample real_tokens with higher weight for larger
-            values (linear weights: k has weight proportional to k), so more batches use
-            longer context. If False, uniform over [min_tokens, num_tokens].
+        batch (list of dict):
+            Each item must contain:
+                - "x":      Tensor [T, C, K]     (waveform tokens)
+                - "y":      Tensor [T*K, C]      (flattened next-sample targets)
+        num_tokens (int):
+            Maximum available tokens per sample.
+        min_tokens (int, optional):
+            Minimum number of tokens to use in a batch.
+        bias_high_tokens (bool, optional):
+            If True, sample `real_tokens` with linearly increasing probability
+            favoring longer contexts. If False, sample uniformly.
 
     Returns:
         dict:
-            x (Tensor): [B, T, K, C] - input waveform tokens
-            y (Tensor): [B, T*K, C] - target waveform tokens
-            padding_mask (Tensor): [B, T] - mask indicating padded tokens
+            {
+                "x": Tensor [B, T', C, K],
+                "y": Tensor [B, T'*K, C],
+                "real_tokens": int
+            }
+            (+ "y_horizon" if present in batch items)
+
+        where:
+            - B  = batch size
+            - T' = sampled real_tokens
+            - K  = samples per token (kernel size)
+            - C  = number of channels
+
+    Notes:
+        - No padding is applied. All samples are truncated to `real_tokens`.
+        - This reduces unnecessary computation compared to zero-padding.
+        - The returned sequences are suitable for causal transformer training
+          without attention masks.
+        - Loss functions should operate only on the returned (non-truncated)
+          target region.
     """
     if bias_high_tokens:
-        # Weights: higher token count => higher weight (linear: 1, 2, ..., n)
         population = list(range(min_tokens, num_tokens + 1))
         weights = [k - min_tokens + 1 for k in population]
         real_tokens = random.choices(population, weights=weights, k=1)[0]
     else:
         real_tokens = random.randint(min_tokens, num_tokens)
-    pad_mask = torch.zeros(num_tokens)
-    pad_mask[real_tokens:] = float("-inf")
 
-    xs, ys, x_freqs, masks = [], [], [], []
+    xs, ys, y_horizons = [], [], []
+    have_y_horizon = "y_horizon" in batch[0]
+
     for item in batch:
-        x = item["x"].clone()  # [T, K, C]
-        y = item["y"].clone()  # [T*K, C] = [L, C]
-        x_freq = item["x_freq"].clone()  # [T, C, F]
+        x = item["x"]   # [T, C, K]
+        y = item["y"]   # [T*K, C]
 
-        x[real_tokens:] = 0
-        x_freq[real_tokens:] = 0
-        y[real_tokens * kernel_size:] = 0  # correct padding
+        K = x.shape[2]
+        xs.append(x[:real_tokens].clone())       # [real_tokens, C, K]
+        ys.append(y[:real_tokens * K].clone())   # [real_tokens*K, C]
 
-        xs.append(x)
-        ys.append(y)
-        x_freqs.append(x_freq)
-        masks.append(pad_mask.clone())
+        if have_y_horizon:
+            yh = item["y_horizon"]   # [H, T*K, C]
+            y_horizons.append(yh[:, :real_tokens * K, :].clone())
 
-    return {
-        "x": torch.stack(xs),  # [B, T, K, C]
-        "y": torch.stack(ys),  # [B, T*K, C] = [B, L, C]
-        "x_freq": torch.stack(x_freqs),  # [B, T, C, F]
-        "padding_mask": torch.stack(masks)  # [B, T]
+    out = {
+        "x": torch.stack(xs),   # [B, real_tokens, C, K]
+        "y": torch.stack(ys),   # [B, real_tokens*K, C]
     }
+    if have_y_horizon:
+        out["y_horizon"] = torch.stack(y_horizons)  # [B, H, real_tokens*K, C]
+    return out
 # --------------------------------------------------------------------------------------
 
 
 
-# =============================================================================
-# Utility: compute per-token FFT features (used by dataset AND rollout/inference)
-# =============================================================================
-_FREQ_EPS = 1e-6
-
-def freq_features_from_tokens(
-    x_time: torch.Tensor,
-    freq_keep_bins: int = 8,
-    freq_log1p: bool = True,
-    freq_norm: str = "none",
-) -> torch.Tensor:
-    """
-    Compute per-token FFT magnitude features from time tokens (NO leakage).
-
-    Shared between dataset preprocessing and autoregressive rollout so that
-    frequency features are always computed identically (rollout parity).
-
-    Args:
-        x_time: [..., C, K]  — last two dims are channels and within-token samples.
-        freq_keep_bins: F, number of low-frequency rFFT bins to keep per channel.
-        freq_log1p: apply log(1 + |FFT|) compression.
-        freq_norm: "none" | "mean" | "l2" — per-token spectrum normalization.
-                   Normalizing reduces sensitivity to amplitude shifts in predicted
-                   tokens during autoregressive rollout.
-
-    Returns:
-        mag: [..., C, F]  same leading dims as input.
-    """
-    X = torch.fft.rfft(x_time, dim=-1)          # [..., C, K//2+1] complex
-    mag = X.abs()                                # [..., C, K//2+1]
-
-    if freq_log1p:
-        mag = torch.log1p(mag)
-
-    Fkeep = min(freq_keep_bins, mag.shape[-1])
-    mag = mag[..., :Fkeep]                       # [..., C, F]
-
-    # Optional per-token normalization (applied over F dimension)
-    if freq_norm == "mean":
-        mag = mag / (mag.mean(dim=-1, keepdim=True) + _FREQ_EPS)
-    elif freq_norm == "l2":
-        mag = mag / (mag.pow(2).sum(dim=-1, keepdim=True).sqrt() + _FREQ_EPS)
-    elif freq_norm != "none":
-        raise ValueError(f"Unknown freq_norm='{freq_norm}', expected 'none'|'mean'|'l2'")
-
-    return mag
-
-
 class SeismicWaveformDataset(Dataset):
     """
-    PyTorch Dataset for seismic waveform data.
+    PyTorch Dataset for seismic waveform data (time-only).
 
-    UPDATED:
-    - Returns multi-modal inputs per token:
-        x_time: [T, C, K]  time-domain tokens
-        x_freq: [T, C*F]   per-token FFT magnitude features (log1p), keeping F low-freq bins
-    - Target remains time-only next token:
-        y: [T*K, C]  (token-shifted, flattened exactly as before)
-
-    This implementation avoids STFT/FFT leakage by computing frequency features
-    strictly from each time token window (length K).
+    Returns per sample:
+        x: [T, C, K]  time-domain tokens
+        y: [T*K, C]   horizon-1 target (flattened next-sample)
+        y_horizon: [H, T*K, C]  multi-horizon targets (if num_pred_horizons > 1)
     """
 
     def __init__(
@@ -182,12 +138,10 @@ class SeismicWaveformDataset(Dataset):
         num_tokens: int = 256,
         training: bool = False,
         normalize: bool = True,
-        # frequency feature config
-        freq_keep_bins: int = 8,     # F: number of low-frequency rFFT bins per channel to keep
-        freq_log1p: bool = True,     # apply log(1 + |FFT|) compression
-        # Per-token spectrum normalization (rollout stability: makes freq features
-        # scale-invariant so predicted-token FFTs match training distribution better)
-        freq_norm: str = "none",     # "none" | "mean" | "l2"
+        random_shift: bool = False,
+        num_pred_horizons: int = 1,
+        aug_polarity_flip: bool = False,
+        aug_channel_swap: bool = False,
     ):
         if sbd is None:
             raise ImportError("seisbench is required for SeismicWaveformDataset. Install with: pip install seisbench")
@@ -199,14 +153,10 @@ class SeismicWaveformDataset(Dataset):
         self.num_tokens = int(num_tokens)
         self.training = bool(training)
         self.normalize = bool(normalize)
-
-        # Frequency features
-        self.freq_keep_bins = int(freq_keep_bins)
-        self.freq_log1p = bool(freq_log1p)
-        self.freq_norm = str(freq_norm)
-        assert self.freq_norm in ("none", "mean", "l2"), \
-            f"freq_norm must be 'none', 'mean', or 'l2', got '{self.freq_norm}'"
-
+        self.random_shift = bool(random_shift)
+        self.num_pred_horizons = max(1, int(num_pred_horizons))
+        self.aug_polarity_flip = bool(aug_polarity_flip)
+        self.aug_channel_swap = bool(aug_channel_swap)
         self.sb_dataset = sbd.WaveformDataset(self.data_dir)
         self.metadata = self.sb_dataset.metadata
 
@@ -249,25 +199,8 @@ class SeismicWaveformDataset(Dataset):
             denom = np.std(strain, axis=1, keepdims=True) + eps
             strain = strain / denom
         elif amp_norm is not None:
-            raise ValueError("amp_norm must be one of: 'peak', 'std', None")
+            raise ValueError("amp_norm must be one of: 'peak', 'std', 'rms', None")
         return strain
-
-    def _freq_features_from_time_tokens(self, x_time: torch.Tensor) -> torch.Tensor:
-        """
-        Compute per-token FFT magnitude features from time tokens only (NO leakage).
-
-        Args:
-            x_time: [T, C, K]  (K=kernel_size)
-
-        Returns:
-            x_freq: [T, C, F] where F=min(freq_keep_bins, K//2+1)
-        """
-        return freq_features_from_tokens(
-            x_time,
-            freq_keep_bins=self.freq_keep_bins,
-            freq_log1p=self.freq_log1p,
-            freq_norm=self.freq_norm,
-        )
 
     def __getitem__(self, idx: int):
         # Load full waveform [C, T_total]
@@ -278,12 +211,17 @@ class SeismicWaveformDataset(Dataset):
         meta = self.metadata.iloc[idx]
         p_sec = meta.get("trace_p_arrival_s", np.nan)
         if np.isfinite(p_sec):
+            if self.random_shift:
+                p_sec += random.randint(-10, 10)
             p_sample = int(p_sec * self.sr)
         else:
             p_sample = 0
 
-        # Slice and pad the waveform
-        required_len = self.context_size + self.kernel_size   # (num_tokens*K + K) => T+1 tokens total
+        # For H prediction horizons we need T+H total tokens so that every
+        # horizon h ∈ {1..H} has T complete target tokens.
+        # required_len = (T + H) * K  samples
+        H = self.num_pred_horizons
+        required_len = self.context_size + self.kernel_size * H
         max_len = waveform.shape[1]
         end_idx = min(p_sample + required_len, max_len)
         actual_len = end_idx - p_sample
@@ -298,31 +236,58 @@ class SeismicWaveformDataset(Dataset):
         # Normalize
         if self.normalize:
             segment = self._normalize_strain_max_per_channel(
-                segment, demean=True, detrend=True, amp_norm="std"
+                segment, demean=True, detrend=True, amp_norm="peak"
             )
 
         # Convert to torch: [L, C]
         segment = segment.T
-        strain = torch.from_numpy(segment).float()
+        strain = torch.from_numpy(segment).float()*10
 
-        # Time tokens: unfold [L, C] -> [T+1, C, K]
-        tokens = strain.unfold(0, self.kernel_size, self.stride)  # [T+1, C, K]
+        # ── Training-only augmentations ───────────────────────────────────────
+        if self.training:
+            # 1. Polarity flip — independently invert sign of each channel.
+            #    Each channel is flipped with p=0.5, independently of the others.
+            if self.aug_polarity_flip:
+                # signs: [1, C]  — each entry is +1 or -1
+                signs = torch.randint(0, 2, (1, strain.shape[1])).float() * 2 - 1
+                strain = strain * signs  # broadcast over time axis
 
-        # AR shift
-        x_time = tokens[:-1].clone()   # [T, C, K]
-        y_time = tokens[1:].clone()    # [T, C, K]
+            # 2. Horizontal channel swap (N ↔ E) — swap channels 1 and 2.
+            #    Valid only when the waveform has at least 3 channels (ZNE order).
+            #    The Z component (channel 0) is never touched.
+            if self.aug_channel_swap and strain.shape[1] >= 3:
+                if random.random() < 0.5:
+                    strain[:, [1, 2]] = strain[:, [2, 1]]
+        # ─────────────────────────────────────────────────────────────────────
 
-        # Frequency features computed strictly from x_time tokens (NO leakage)
-        x_freq = self._freq_features_from_time_tokens(x_time)  # [T, C, F]
+        # Time tokens: unfold [L, C] -> [T+H, C, K]
+        tokens = strain.unfold(0, self.kernel_size, self.stride)  # [T+H, C, K]
+        T = self.num_tokens
 
-        # y formatted exactly as before: [T*K, C]
-        y = y_time.permute(0, 2, 1).contiguous().view(-1, y_time.shape[1])
+        # Input context: first T tokens
+        x_time = tokens[:T].clone()   # [T, C, K]
 
-        return {
-            "x": x_time,   # [T, C, K]
-            "x_freq": x_freq,   # [T, C, F]
-            "y": y,             # [T*K, C]
+        # Horizon-1 target (backward-compatible "y" key): [T*K, C]
+        y_h1 = tokens[1:T + 1].clone()   # [T, C, K]
+        y = y_h1.permute(0, 2, 1).contiguous().view(-1, y_h1.shape[1])  # [T*K, C]
+
+        # Multi-horizon targets stacked as [H, T*K, C].
+        # horizon h target  =  tokens[h : T+h]  (shape [T, C, K])
+        y_horizons = []
+        for h in range(1, H + 1):
+            y_h = tokens[h:T + h].clone()   # [T, C, K]
+            y_horizons.append(
+                y_h.permute(0, 2, 1).contiguous().view(-1, y_h.shape[1])
+            )                               # each [T*K, C]
+        y_horizon = torch.stack(y_horizons, dim=0)  # [H, T*K, C]
+
+        out = {
+            "x":         x_time,    # [T, C, K]
+            "y":         y,         # [T*K, C]     horizon-1
+            "y_horizon": y_horizon, # [H, T*K, C]  all H horizons
         }
+
+        return out
 
 
 class SeismicDataModule(LightningDataModule):
@@ -340,7 +305,10 @@ class SeismicDataModule(LightningDataModule):
         num_workers: int = 8,
         num_tokens: int = 256,
         normalize: bool = True,
-        freq_norm: str = "none",     # per-token spectrum normalization (rollout parity)
+        random_shift: bool = False,
+        num_pred_horizons: int = 1,  # must match model num_pred_horizons
+        aug_polarity_flip: bool = False,
+        aug_channel_swap: bool = False,
     ):
         super().__init__()
         self.data_dir = data_dir
@@ -350,7 +318,10 @@ class SeismicDataModule(LightningDataModule):
         self.num_workers = num_workers
         self.num_tokens = num_tokens
         self.normalize = normalize
-        self.freq_norm = freq_norm
+        self.random_shift = random_shift
+        self.num_pred_horizons = max(1, int(num_pred_horizons))
+        self.aug_polarity_flip = aug_polarity_flip
+        self.aug_channel_swap = aug_channel_swap
         self.save_hyperparameters()
 
     def setup(self, stage=None):
@@ -361,7 +332,10 @@ class SeismicDataModule(LightningDataModule):
             num_tokens=self.num_tokens,
             training=False,
             normalize=self.normalize,
-            freq_norm=self.freq_norm,
+            random_shift=self.random_shift,
+            num_pred_horizons=self.num_pred_horizons,
+            aug_polarity_flip=self.aug_polarity_flip,
+            aug_channel_swap=self.aug_channel_swap,
         )
         train_len = int(0.8 * len(self.full_dataset))
         val_len = int(0.1 * len(self.full_dataset))
@@ -382,7 +356,6 @@ class SeismicDataModule(LightningDataModule):
         return functools.partial(
             waveform_collate_fn,
             num_tokens=self.hparams.num_tokens,
-            kernel_size=self.hparams.kernel_size,
         )
 
 
@@ -406,6 +379,7 @@ class SeismicDataModule(LightningDataModule):
             shuffle=False,
             num_workers=self.num_workers,
             pin_memory=True,
+            persistent_workers=self.num_workers > 0,
             collate_fn=self._make_collate_fn(),
         )
 

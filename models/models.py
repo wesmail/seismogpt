@@ -56,36 +56,44 @@ class RotaryPositionalEmbedding(nn.Module):
     Rotary Position Embedding (RoPE) from the RoFormer paper.
     Applies rotation to query and key vectors based on their position,
     enabling relative position awareness without explicit position embeddings.
+
+    Cache is fully pre-allocated at __init__ time up to max_len as registered
+    buffers (fp32). This avoids any runtime reallocation, Python-level non-buffer
+    tensors, and dtype-conversion surprises during mixed-precision training.
+    The forward pass is a simple slice + dtype cast — no conditional logic.
     """
     def __init__(self, dim: int, max_len: int = 10000, base: float = 10000.0):
         super().__init__()
         self.dim = dim
         self.max_len = max_len
         self.base = base
+
+        # inv_freq: [dim/2]
         inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2).float() / dim))
         self.register_buffer("inv_freq", inv_freq, persistent=False)
-        self._cos_cache = None
-        self._sin_cache = None
-        self._cache_len = 0
 
-    def _update_cache(self, seq_len: int, device: torch.device, dtype: torch.dtype):
-        if self._cos_cache is not None and self._cache_len >= seq_len:
-            return
-        t = torch.arange(seq_len, device=device, dtype=torch.float32)
-        freqs = torch.outer(t, self.inv_freq.to(device))
-        emb = torch.cat([freqs, freqs], dim=-1)
-        self._cos_cache = emb.cos().unsqueeze(0).unsqueeze(0).to(dtype)
-        self._sin_cache = emb.sin().unsqueeze(0).unsqueeze(0).to(dtype)
-        self._cache_len = seq_len
+        # Pre-compute cos/sin tables up to max_len in fp32.
+        # Shape: [1, 1, max_len, dim]  (ready to broadcast over B and num_heads)
+        # Memory: 2 × max_len × dim × 4 bytes
+        #   e.g. max_len=5000, dim=32  →  2 × 5000 × 32 × 4 = 1.28 MB — negligible.
+        t = torch.arange(max_len).float()                     # [max_len]
+        freqs = torch.outer(t, inv_freq)                      # [max_len, dim/2]
+        emb = torch.cat([freqs, freqs], dim=-1)               # [max_len, dim]
+        self.register_buffer("cos_cache", emb.cos().unsqueeze(0).unsqueeze(0), persistent=False)  # [1,1,max_len,dim]
+        self.register_buffer("sin_cache", emb.sin().unsqueeze(0).unsqueeze(0), persistent=False)  # [1,1,max_len,dim]
 
     def forward(self, q: torch.Tensor, k: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """
-        q, k: (B, num_heads, seq_len, head_dim)
+        Args:
+            q, k: (B, num_heads, seq_len, head_dim)
+        Returns:
+            Rotated (q, k) with same shape.
         """
         seq_len = q.size(2)
-        self._update_cache(seq_len, q.device, q.dtype)
-        cos = self._cos_cache[:, :, :seq_len, :].to(q.dtype)
-        sin = self._sin_cache[:, :, :seq_len, :].to(q.dtype)
+        # Slice to actual seq_len and cast to match q/k dtype (e.g. bf16).
+        # No reallocation — just a view + dtype cast (cheap).
+        cos = self.cos_cache[:, :, :seq_len, :].to(q.dtype)  # [1, 1, seq_len, dim]
+        sin = self.sin_cache[:, :, :seq_len, :].to(q.dtype)  # [1, 1, seq_len, dim]
         return self._apply_rotary(q, cos, sin), self._apply_rotary(k, cos, sin)
 
     @staticmethod
@@ -330,68 +338,66 @@ class TokenEmbedding(nn.Module):
 
         return tok.view(B, T, self.d_model)
 
-
-# =============================================================================
-# Lightweight MLP embedding for frequency features (small F bins)
-# =============================================================================
-
-class FreqMLPEmbed(nn.Module):
+class TokenEmbeddingFast(nn.Module):
     """
-    Maps per-token frequency features [B, T, C, F] -> [B, T, d_model].
+    Fast token embedding:
+      x: [B, T, C, K] -> e: [B, T, d_model]
 
-    Motivation: TokenEmbedding (conv-based) is over-parameterized for small F
-    (e.g. F=8).  A simple Linear+GELU+LayerNorm is cheaper and sufficient for
-    low-dimensional spectral summaries.
+    Steps:
+      1) 1x1 conv mixes channels at each k (no dilations, no within-token temporal conv)
+      2) pool over K: mean, and optionally last sample
+      3) linear projection + LayerNorm
+
+    Constructor matches :class:`TokenEmbedding` so callers (CLI/config, GPT) can swap
+    implementations without changing kwargs. ``kernel_size``, ``num_layers``,
+    ``dilation_growth``, and ``attn_dropout`` are ignored by this path.
     """
-
-    def __init__(self, in_channels: int, freq_bins: int, d_model: int):
+    def __init__(
+        self,
+        in_channels: int,
+        d_model: int,
+        kernel_size: int = 7,
+        num_layers: int = 4,
+        dilation_growth: int = 2,
+        dropout: float = 0.0,
+        act: nn.Module = nn.GELU(),
+        attn_dropout: float = 0.0,
+        use_last: bool = True,
+    ):
         super().__init__()
-        in_dim = in_channels * freq_bins   # flatten C*F per token
-        self.net = nn.Sequential(
-            nn.Linear(in_dim, d_model),
-            nn.GELU(),
-            nn.LayerNorm(d_model),
-        )
+        self.use_last = use_last
 
-    def forward(self, x_freq: torch.Tensor) -> torch.Tensor:
-        """x_freq: [B, T, C, F] -> [B, T, d_model]"""
-        B, T, C, F = x_freq.shape
-        return self.net(x_freq.reshape(B, T, C * F))
+        # channel mix per sample
+        self.in_proj = nn.Conv1d(in_channels, d_model, kernel_size=1, bias=False)
+        self.act = act if isinstance(act, nn.Module) else act()
+        self.drop = nn.Dropout(dropout)
 
-
-# =============================================================================
-# Causal Stitcher 1D
-# =============================================================================
-
-class CausalStitcher1D(nn.Module):
-    """
-    Small causal Conv1D residual stack operating on sample axis.
-    Input/Output: [B, C, L]
-    """
-    def __init__(self, channels: int, hidden: int = 64, kernel_size: int = 9, num_layers: int = 4, dropout: float = 0.0):
-        super().__init__()
-        assert kernel_size >= 2
-        self.kernel_size = int(kernel_size)
-
-        self.in_proj = nn.Conv1d(channels, hidden, kernel_size=1, bias=False)
-        self.blocks = nn.ModuleList()
-        for _ in range(num_layers):
-            self.blocks.append(nn.Sequential(
-                nn.Conv1d(hidden, hidden, kernel_size=self.kernel_size, padding=0, bias=False),
-                nn.GELU(),
-                nn.Dropout(dropout),
-                nn.Conv1d(hidden, hidden, kernel_size=1, bias=False),
-            ))
-        self.out_proj = nn.Conv1d(hidden, channels, kernel_size=1, bias=False)
+        in_dim = (2 * d_model) if use_last else d_model
+        self.out_proj = nn.Linear(in_dim, d_model, bias=True)
+        self.out_norm = nn.LayerNorm(d_model)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x: [B, C, L]
-        h = self.in_proj(x)
-        for blk in self.blocks:
-            h_pad = F.pad(h, (self.kernel_size - 1, 0))  # left pad only (causal)
-            h = h + blk(h_pad)
-        y = self.out_proj(h)
-        return y
+        if x.dim() != 4:
+            raise ValueError(f"Expected [B,T,C,K], got {x.shape}")
+
+        B, T, C, K = x.shape
+        h = x.reshape(B * T, C, K)          # [B*T, C, K]
+        h = self.in_proj(h)                # [B*T, d_model, K]
+        h = self.act(h)
+        h = self.drop(h)
+
+        # pool over within-token axis K
+        tok_mean = h.mean(dim=-1)          # [B*T, d_model]
+
+        if self.use_last:
+            tok_last = h[..., -1]          # [B*T, d_model]
+            tok = torch.cat([tok_mean, tok_last], dim=-1)  # [B*T, 2*d_model]
+        else:
+            tok = tok_mean                 # [B*T, d_model]
+
+        tok = self.out_proj(tok)           # [B*T, d_model]
+        tok = self.out_norm(tok)
+        return tok.view(B, T, -1)      
 
 
 # =============================================================================
@@ -402,6 +408,13 @@ class GPT(nn.Module):
     """
     GPT model for seismic tokens.
     Uses TokenCausalEmbedding over K (within-token time) instead of 1x1 conv "Embedding".
+
+    Probabilistic checkpoints use ``shared_mu_head`` / ``shared_sigma_head`` with a shared
+    ``horizon_embed``. The second half of the 2×C output is a nonnegative scale read out by
+    ``GPTLightning``: Gaussian σ (``time_loss=="nll"``), Laplace scale b (``nll_laplace``),
+    or Student-t scale s (``nll_studentt``)—same head, same clamp semantics in Lightning.
+    When fine-tuning into a probabilistic mode, load with ``strict=False`` if new sigma-head
+    weights should stay randomly initialized.
     
     OPTIMIZATIONS:
     - Flash Attention enabled via is_causal flag (no explicit mask)
@@ -415,7 +428,6 @@ class GPT(nn.Module):
         kernel_size: int = 16,
         num_tokens: int = 256,
         d_model: int = 128,
-        num_layers: int = 3,  # kept for compatibility; not used by TokenCausalEmbedding
         num_heads: int = 2,
         num_enc_layers: int = 2,
         dropout: float = 0.1,
@@ -426,20 +438,13 @@ class GPT(nn.Module):
         token_cnn_layers: int = 4,
         token_cnn_dilation_growth: int = 2,
         token_cnn_dropout: float = 0.0,
-        # Post-head stitcher
-        use_stitcher: bool = True,
-        stitcher_hidden: int = 64,
-        stitcher_kernel: int = 9,
-        stitcher_layers: int = 4,
-        stitcher_dropout: float = 0.0,
 
-        # multi-modal fusion type
-        fusion_type: str = "cross_attention",
-
-        # --- NEW: frequency embedding config (rollout stability) ---
-        freq_embed_type: str = "mlp",   # "mlp" (lightweight) or "conv" (legacy TokenEmbedding)
-        freq_keep_bins: int = 8,        # F bins per channel (must match dataset)
-        freq_gate: bool = True,         # learned sigmoid gate on freq contribution
+        # ── Multi-step prediction horizons ──────────────────────────────────
+        # Horizon-conditioned shared MLP heads (+Embedding); idx 0 = inference horizon.
+        num_pred_horizons: int = 1,
+        # If True, shared sigma MLP and concat [mu, scale] per sample (2*C channels).
+        # Lightning interprets scale as σ / b / s depending on ``time_loss``.
+        probabilistic_output: bool = False,
     ):
         super().__init__()
 
@@ -454,21 +459,34 @@ class GPT(nn.Module):
         self.max_len = max_len
         self.dim_feedforward = self.d_model * dim_feedforward_multiplier
 
-        # Post-head stitcher config
-        self.use_stitcher = use_stitcher
-        self.stitcher_hidden = stitcher_hidden
-        self.stitcher_kernel = stitcher_kernel
-        self.stitcher_layers = stitcher_layers
-        self.stitcher_dropout = stitcher_dropout
+        self.num_pred_horizons = max(1, int(num_pred_horizons))
+        self.probabilistic_output = bool(probabilistic_output)
+        self.out_channels = self.in_channels * (2 if self.probabilistic_output else 1)
 
-        # Multi-modal fusion type
-        self.fusion_type = fusion_type
-        self.freq_embed_type = freq_embed_type
-        self.freq_gate_enabled = freq_gate
-        self.freq_keep_bins = freq_keep_bins
+        ck = self.in_channels * self.kernel_size
+        self.horizon_embed = nn.Embedding(self.num_pred_horizons, self.d_model)
+        nn.init.normal_(self.horizon_embed.weight, std=0.02)
+        self.shared_mu_head = nn.Sequential(
+            nn.Linear(self.d_model, self.d_model),
+            nn.GELU(),
+            nn.Linear(self.d_model, ck),
+        )
+        self.shared_sigma_head: Optional[nn.Sequential]
+        if self.probabilistic_output:
+            self.shared_sigma_head = nn.Sequential(
+                nn.Linear(self.d_model, self.d_model),
+                nn.GELU(),
+                nn.Linear(self.d_model, ck),
+            )
+            # Conservative final-layer init: small initial scales for Gaussian σ, Laplace b,
+            # and Student-t s (same ``shared_sigma_head`` for all probabilistic losses).
+            nn.init.normal_(self.shared_sigma_head[-1].weight, std=0.01)
+            nn.init.constant_(self.shared_sigma_head[-1].bias, -2.0)
+        else:
+            self.shared_sigma_head = None
 
-        # Causal CNN over K inside each token
-        self.time_token_embed = TokenEmbedding(
+        # Causal CNN over K inside each token (time-only; no frequency branch)
+        self.time_token_embed = TokenEmbeddingFast(
             in_channels=in_channels,
             d_model=self.d_model,
             kernel_size=token_cnn_kernel,
@@ -477,52 +495,6 @@ class GPT(nn.Module):
             dropout=token_cnn_dropout,
             act=nn.GELU(),
         )
-
-        # Frequency embedding: MLP (lightweight, better for small F) or conv (legacy)
-        if freq_embed_type == "mlp":
-            self.frequency_token_embed = FreqMLPEmbed(
-                in_channels=in_channels,
-                freq_bins=freq_keep_bins,
-                d_model=self.d_model,
-            )
-        elif freq_embed_type == "conv":
-            # Legacy: conv-based TokenEmbedding (expects [B,T,C,K]-shaped input)
-            self.frequency_token_embed = TokenEmbedding(
-                in_channels=in_channels,
-                d_model=self.d_model,
-                kernel_size=token_cnn_kernel,
-                num_layers=token_cnn_layers,
-                dilation_growth=token_cnn_dilation_growth,
-                dropout=token_cnn_dropout,
-                act=nn.GELU(),
-            )
-        else:
-            raise ValueError(f"Unknown freq_embed_type='{freq_embed_type}'")
-
-        # Learned gate: allows the model to down-weight noisy freq info during
-        # autoregressive rollout where FFT features come from predicted tokens.
-        # g = sigmoid(Linear([h_time; h_freq])) in [0,1], then h = h_time + g * h_freq
-        if freq_gate:
-            self.freq_gate_proj = nn.Linear(self.d_model * 2, 1)
-        else:
-            self.freq_gate_proj = None
-
-        # Legacy fusion layers (kept for backward compat when freq_gate=False)
-        if not freq_gate:
-            if fusion_type == "concat":
-                self.fusion = nn.Linear(self.d_model * 2, self.d_model)
-            elif fusion_type == "add":
-                self.fusion = nn.LayerNorm(self.d_model)
-            elif fusion_type == "cross_attention":
-                self.cross_attn = nn.MultiheadAttention(
-                    embed_dim=self.d_model,
-                    num_heads=num_heads,
-                    dropout=dropout,
-                    batch_first=True,
-                )
-                self.fusion = nn.LayerNorm(self.d_model)
-            else:
-                raise ValueError(f"Unknown fusion_type='{fusion_type}'.")           
 
         # Stack of RoPE encoder layers (Flash Attention optimized)
         self.encoder_layers = nn.ModuleList([
@@ -535,28 +507,23 @@ class GPT(nn.Module):
             for _ in range(num_enc_layers)
         ])
 
-        self.pred_head = nn.Linear(self.d_model, in_channels * kernel_size)
         self.dropout_layer = nn.Dropout(p=dropout)
 
-        if self.use_stitcher:
-            self.stitcher = CausalStitcher1D(
-                channels=self.in_channels,
-                hidden=stitcher_hidden,
-                kernel_size=stitcher_kernel,
-                num_layers=stitcher_layers,
-                dropout=stitcher_dropout,
-            )
-
-    def forward(self, x_time: torch.Tensor, x_freq: Optional[torch.Tensor] = None,
-                is_causal: bool = False) -> torch.Tensor:
+    def forward(self, x_time: torch.Tensor, is_causal: bool = False):
         """
         Args:
-            x_time: Input tensor of shape [B, T, C, K]
-            x_freq: Input tensor of shape [B, T, C, F] (or None to skip freq branch)
-            is_causal: If True, uses causal attention (for autoregressive training)
-        
+            x_time:    [B, T, C, K]
+            is_causal: enable causal masking in SDPA (Flash Attention compatible)
+
         Returns:
-            Predictions of shape [B, T*K, C]
+            predictions : List[Tensor[B, T*K, C_out]], length = num_pred_horizons
+                C_out = C (deterministic) or 2*C (concat [mu, scale] per channel; scale is σ, b,
+                or s per ``GPTLightning.time_loss``).
+                predictions[0]  horizon-1 (next token), used at inference
+                predictions[h]  horizon h+1 (training-only auxiliary heads)
+
+        Note: when num_pred_horizons == 1 the list has exactly one element.
+              Always use predictions[0] at inference.
         """
         if x_time.dim() != 4:
             raise ValueError(f"Expected 4D input [B, T, C, K], got {x_time.shape}")
@@ -565,54 +532,36 @@ class GPT(nn.Module):
         if C != self.in_channels or K != self.kernel_size:
             raise ValueError(
                 f"Input has C={C},K={K} but model expects C={self.in_channels},K={self.kernel_size}"
-            )     
+            )
 
-        # Time-domain token embeddings: [B, T, d_model]
-        h_time = self.time_token_embed(x_time)
-        h_time = self.dropout_layer(h_time)
+        # ── Encoder (time-only) ─────────────────────────────────────────────
+        h = self.time_token_embed(x_time)       # [B, T, d_model]
+        h = self.dropout_layer(h)
 
-        # Frequency branch (skipped cleanly when x_freq is None or freq_keep_bins==0)
-        use_freq = (x_freq is not None and self.freq_keep_bins > 0)
-        if use_freq:
-            h_freq = self.frequency_token_embed(x_freq)  # [B, T, d_model]
-            h_freq = self.dropout_layer(h_freq)
-
-            if self.freq_gate_enabled and self.freq_gate_proj is not None:
-                # Learned gate: sigmoid controls how much freq info to trust.
-                # During rollout, freq features come from predicted tokens and may
-                # be unreliable; the gate learns to down-weight them when needed.
-                g = torch.sigmoid(self.freq_gate_proj(
-                    torch.cat([h_time, h_freq], dim=-1)
-                ))  # [B, T, 1]
-                h = h_time + g * h_freq
-            else:
-                # Legacy fusion paths (preserved for backward compat)
-                if self.fusion_type == "concat":
-                    h = torch.cat([h_time, h_freq], dim=-1)
-                    h = self.fusion(h)
-                elif self.fusion_type == "add":
-                    h = self.fusion(h_time + h_freq)
-                elif self.fusion_type == "cross_attention":
-                    h_cross, _ = self.cross_attn(h_time, h_freq, h_freq)
-                    h = self.fusion(h_time + h_cross)
-        else:
-            # No freq info: pure time-domain path (zero overhead)
-            h = h_time
-
-        # OPTIMIZED: No explicit causal mask - just pass is_causal flag
-        # This allows Flash Attention to be used when available
         for layer in self.encoder_layers:
-            h = layer(h, is_causal=is_causal)
+            h = layer(h, is_causal=is_causal)        # [B, T, d_model]
 
-        # Single output (mean prediction): [B, T, C*K] -> [B, T*K, C]
-        out = self.pred_head(h)                      # [B, T, C*K]
-        out = out.view(B, T, K, C).contiguous()      # [B, T, K, C]
-        out = out.view(B, T * K, C)                  # [B, T*K, C]
+        # ── Multi-step prediction heads (horizon-conditioned shared MLP) ─────
+        predictions: List[torch.Tensor] = []
+        for idx in range(self.num_pred_horizons):
+            hz = self.horizon_embed.weight[idx].view(1, 1, -1)  # [1,1,d_model]
+            h_cond = h + hz
+            mu_h = self.shared_mu_head(h_cond)                       # [B, T, C*K]
+            mu_h = mu_h.view(B, T, K, self.in_channels).contiguous()
 
-        if self.use_stitcher:
-            out = self.stitcher(out.transpose(1, 2)).transpose(1, 2)  # [B, C, L] -> [B, L, C]
+            if self.probabilistic_output and self.shared_sigma_head is not None:
+                raw_sig = self.shared_sigma_head(h_cond)
+                raw_sig = raw_sig.view(B, T, K, self.in_channels)
+                sigma_h = F.softplus(raw_sig) + 1e-4
+                mu_flat = mu_h.reshape(B, T * K, self.in_channels)
+                sig_flat = sigma_h.reshape(B, T * K, self.in_channels)
+                out_h = torch.cat([mu_flat, sig_flat], dim=-1)             # [B, T*K, 2*C]
+            else:
+                out_h = mu_h.reshape(B, T * K, self.in_channels)           # [B, T*K, C]
 
-        return out
+            predictions.append(out_h)
+
+        return predictions
 
 
 # =============================================================================

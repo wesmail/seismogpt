@@ -1,24 +1,15 @@
 #!/usr/bin/env python3
 """
-Publication-ready global metrics violin plots from rollout CSV files.
+Publication-ready grouped box-plot figure from rollout CSV files.
 
-Same file-discovery and config-parsing logic as plot_global_metrics_from_csv.py,
-but uses violin plots instead of box plots.
-
-Each violin:
-  • KDE body (full distribution shape)
-  • Inner IQR bar (thick, white)
-  • Median tick (white)
-  • Mean diamond (amber)
-  • Clipped-outlier count annotations (+k / −k) when y-limits hide extreme tails
-  • n= sample count below each violin
-
-One figure per (metric, channel):
-  NCC_{Z,N,E}  and  PSD_logl2_{Z,N,E}  — 6 individual files.
+Produces a single 1x3 panel figure (NCC | SNR | PSD) with grouped box plots:
+  - X-axis per panel: channels Z, N, E
+  - Within each channel group: one box per configuration (A, B, C, …), color-coded
+  - Shared legend at top
 
 Usage:
-  python plot_violin_metrics.py --csv-dir . --output-dir violin_plots
-  python plot_violin_metrics.py --csv a.csv b.csv --output-dir violin_plots
+  python plot_global_metrics_from_csv.py --csv-dir . --output-dir metrics_plots
+  python plot_global_metrics_from_csv.py --csv a.csv b.csv --output metrics_combined.pdf
 """
 
 import argparse
@@ -30,9 +21,9 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import matplotlib.ticker as mpl_ticker
+import matplotlib.patches as mpatches
 import numpy as np
 import pandas as pd
-from scipy.stats import gaussian_kde
 
 # ---------------------------------------------------------------------------
 # Global style
@@ -41,64 +32,74 @@ plt.rcParams.update({
     "font.family":          "serif",
     "font.serif":           ["DejaVu Serif", "Times New Roman", "Times", "serif"],
     "mathtext.fontset":     "dejavuserif",
-    "font.size":            9,
-    "axes.titlesize":       10,
-    "axes.labelsize":       9,
-    "legend.fontsize":      8,
-    "xtick.labelsize":      20,
-    "ytick.labelsize":      20,
-    "figure.titlesize":     10,
+    "font.size":            8,
+    "axes.titlesize":       9,
+    "axes.labelsize":       8,
+    "legend.fontsize":      7.5,
+    "xtick.labelsize":      8,
+    "ytick.labelsize":      7,
+    "figure.titlesize":     9,
     "lines.linewidth":      0.9,
     "axes.spines.top":      False,
     "axes.spines.right":    False,
-    "axes.linewidth":       0.7,
+    "axes.linewidth":       0.5,
     "axes.grid":            True,
-    "grid.color":           "#cccccc",
-    "grid.linewidth":       0.4,
-    "grid.alpha":           0.5,
+    "grid.color":           "#d5d5d5",
+    "grid.linewidth":       0.25,
+    "grid.alpha":           0.6,
     "xtick.direction":      "out",
     "ytick.direction":      "out",
-    "xtick.major.width":    0.7,
-    "ytick.major.width":    0.7,
-    "xtick.major.size":     3,
-    "ytick.major.size":     3,
+    "xtick.major.width":    0.5,
+    "ytick.major.width":    0.5,
+    "xtick.major.size":     2.5,
+    "ytick.major.size":     2.5,
     "figure.facecolor":     "white",
     "axes.facecolor":       "white",
-    "savefig.dpi":          300,
+    "savefig.dpi":          600,
+    "savefig.bbox":         "tight",
+    "savefig.pad_inches":   0.02,
     "figure.dpi":           150,
+    "pdf.fonttype":         42,
+    "ps.fonttype":          42,
 })
 
 # ---------------------------------------------------------------------------
-# Colour palette
+# Colour palette — colorblind-friendly, 3-config default
 # ---------------------------------------------------------------------------
-METRIC_COLORS = {
-    "ncc":       "#2c3e7a",   # slate blue
-    "psd_logl2": "#b5320a",   # crimson
-}
-MEAN_COLOR   = "#f0a500"      # amber diamond
-INNER_COLOR  = "#ffffff"      # white IQR bar / median tick
-FLIER_COLOR  = "#888888"      # grey outlier count text
+CONFIG_COLORS = [
+    "#4477AA",   # blue
+    "#EE6677",   # rose/red # "#EE7733",   # orange (replaces rose)
+    "#228833",   # green    # "#66CCEE",   # cyan (replaces green)
+    "#CCBB44",   # yellow
+    "#66CCEE",   # cyan
+    "#AA3377",   # purple
+    "#BBBBBB",   # grey
+]
+
+
+MEAN_COLOR = "#222222"
 
 CHANNELS = ["Z", "N", "E"]
-METRICS  = ["ncc", "psd_logl2"]
+METRICS  = ["ncc", "snr_db", "psd_logl2"]
 
 METRIC_META = {
     "ncc": {
-        "ylabel":    "NCC",
-        "title_fmt": "Channel {ch}",
-        "ref_line":  0.0,
-        "ref_label": "NCC = 0",
+        "ylabel":   "NCC",
+        "ref_line": None,
+        "y_max":    1.02,
+    },
+    "snr_db": {
+        "ylabel":   "SRR",
+        "ref_line": 0.0,
     },
     "psd_logl2": {
-        "ylabel":    "PSD log-L² error",
-        "title_fmt": "Channel {ch}",
-        "ref_line":  None,
-        "ref_label": None,
+        "ylabel":   r"PSD log-$L^2$ error",
+        "ref_line": None,
     },
 }
 
 # ---------------------------------------------------------------------------
-# Filename parsing  (identical to box-plot script)
+# Filename parsing
 # ---------------------------------------------------------------------------
 
 def parse_context_future(csv_path: Path) -> Tuple[Optional[int], Optional[int]]:
@@ -112,7 +113,7 @@ def collect_configs(csv_paths: List[Path]):
         ctx, fut = parse_context_future(p)
         sort_key = (ctx if ctx is not None else 9999,
                     fut if fut is not None else 9999)
-        label = f"{ctx} s / {fut} s" if ctx is not None else p.stem
+        label = f"{ctx}s / {fut}s" if ctx is not None else p.stem
         parsed.append((sort_key, label, p))
     parsed.sort(key=lambda x: x[0])
     return [
@@ -122,249 +123,144 @@ def collect_configs(csv_paths: List[Path]):
 
 
 # ---------------------------------------------------------------------------
-# Robust y-limits  (same logic as box-plot script)
+# Core: draw one group of boxes at a channel position
 # ---------------------------------------------------------------------------
 
-def _robust_ylim(
-    data_list: List[np.ndarray],
-    ref_line:  Optional[float],
-    p_lo: float = 2,
-    p_hi: float = 98,
-    pad_frac: float = 0.15,
-) -> Tuple[float, float]:
-    all_vals = np.concatenate([v for v in data_list if len(v) > 0])
-    if len(all_vals) == 0:
-        return 0.0, 1.0
-    lo, hi = np.percentile(all_vals, p_lo), np.percentile(all_vals, p_hi)
-    span   = hi - lo if hi > lo else 1.0
-    pad    = pad_frac * span
-    y_lo   = lo - pad
-    y_hi   = hi + pad
-    if ref_line is not None:
-        y_lo = min(y_lo, ref_line - 0.05)
-    return float(y_lo), float(y_hi)
-
-
-# ---------------------------------------------------------------------------
-# Core violin drawing  (manual KDE so we can clip to y-limits)
-# ---------------------------------------------------------------------------
-
-def _draw_violin(
+def _draw_grouped_boxes(
     ax,
-    vals: np.ndarray,
-    pos: float,
-    y_lo: float,
-    y_hi: float,
-    color: str,
-    width: float = 0.7,
-    bw_method: str = "scott",
+    data_per_config: List[np.ndarray],
+    group_center: float,
+    colors: List[str],
+    box_width: float = 0.22,
+    gap: float = 0.02,
 ) -> None:
     """
-    Draw a single violin at x=pos clipped to [y_lo, y_hi].
-    The KDE is evaluated only within the visible range so the body never
-    bleeds outside the axes boundaries.
+    Draw N side-by-side box plots centred at *group_center*.
+
+    Each box:  IQR body, median line, mean diamond, 1.5*IQR whiskers, no fliers.
     """
-    if len(vals) < 4:
-        return
+    n = len(data_per_config)
+    total_w = n * box_width + (n - 1) * gap
+    x_start = group_center - total_w / 2 + box_width / 2
 
-    # KDE evaluated on a fine grid clipped to the axes range
-    y_grid = np.linspace(y_lo, y_hi, 400)
-    try:
-        kde  = gaussian_kde(vals, bw_method=bw_method)
-        dens = kde(y_grid)
-    except Exception:
-        return
+    for i, vals in enumerate(data_per_config):
+        if len(vals) == 0:
+            continue
+        x = x_start + i * (box_width + gap)
+        color = colors[i % len(colors)]
 
-    dens = np.maximum(dens, 0)
-    max_dens = dens.max()
-    if max_dens == 0:
-        return
+        q1, med, q3 = np.percentile(vals, [25, 50, 75])
+        iqr = q3 - q1
+        whisker_lo = max(vals.min(), q1 - 1.5 * iqr)
+        whisker_hi = min(vals.max(), q3 + 1.5 * iqr)
+        mean_val = float(np.mean(vals))
 
-    # Normalise density so half-width == width/2
-    half_w = (dens / max_dens) * (width / 2)
+        hw = box_width / 2
 
-    x_left  = pos - half_w
-    x_right = pos + half_w
+        # In _draw_grouped_boxes, add hatch patterns:
+        HATCHES = ["", "//", "\\\\", "xx", "..", "oo"]        
+        # Box (IQR)
+        rect = plt.Rectangle(
+            (x - hw, q1), box_width, iqr,
+            facecolor=color, edgecolor=color,
+            alpha=0.40, linewidth=0.6, zorder=3,
+            hatch=HATCHES[i % len(HATCHES)],
+        )
+        ax.add_patch(rect)
+        # Box outline
+        ax.plot([x - hw, x + hw, x + hw, x - hw, x - hw],
+                [q1, q1, q3, q3, q1],
+                color=color, lw=0.6, zorder=4)
 
-    # Filled body
-    ax.fill_betweenx(y_grid, x_left, x_right,
-                     color=color, alpha=0.35, linewidth=0, zorder=2)
-    # Outline
-    ax.plot(x_left,  y_grid, color=color, lw=0.7, alpha=0.80, zorder=3)
-    ax.plot(x_right, y_grid, color=color, lw=0.7, alpha=0.80, zorder=3)
+        # Median line
+        ax.plot([x - hw, x + hw], [med, med],
+                color=color, lw=1.2, solid_capstyle="butt", zorder=5)
 
+        # Whiskers
+        ax.plot([x, x], [whisker_lo, q1], color=color, lw=0.6, zorder=3)
+        ax.plot([x, x], [q3, whisker_hi], color=color, lw=0.6, zorder=3)
+        cap_hw = hw * 0.5
+        ax.plot([x - cap_hw, x + cap_hw], [whisker_lo, whisker_lo],
+                color=color, lw=0.6, zorder=3)
+        ax.plot([x - cap_hw, x + cap_hw], [whisker_hi, whisker_hi],
+                color=color, lw=0.6, zorder=3)
 
-def _draw_inner_stats(
-    ax,
-    vals: np.ndarray,
-    pos: float,
-    y_lo: float,
-    y_hi: float,
-) -> None:
-    """
-    Overlay the inner statistics on a violin:
-      • Thick white bar spanning the IQR
-      • White tick for the median
-      • Amber diamond for the mean (clipped to visible range)
-    """
-    if len(vals) == 0:
-        return
-
-    q1, med, q3 = np.percentile(vals, [25, 50, 75])
-    mean_val     = float(np.mean(vals))
-
-    # Clip to visible range
-    q1_c    = np.clip(q1,       y_lo, y_hi)
-    q3_c    = np.clip(q3,       y_lo, y_hi)
-    med_c   = np.clip(med,      y_lo, y_hi)
-    mean_c  = np.clip(mean_val, y_lo, y_hi)
-
-    # IQR bar — thin vertical white line
-    ax.plot([pos, pos], [q1_c, q3_c],
-            color=INNER_COLOR, lw=3.5, solid_capstyle="round", zorder=5)
-
-    # Median tick — short horizontal white bar
-    tick_hw = 0.06
-    ax.plot([pos - tick_hw, pos + tick_hw], [med_c, med_c],
-            color=INNER_COLOR, lw=2.0, solid_capstyle="round", zorder=6)
-
-    # Mean diamond
-    ax.scatter([pos], [mean_c],
-               marker="D", s=22, color=MEAN_COLOR,
-               zorder=7, linewidths=0.4, edgecolors="white")
-
-
-def _draw_mean_median_labels(
-    ax,
-    vals: np.ndarray,
-    pos: float,
-    y_lo: float,
-    y_hi: float,
-    decimals: int = 3,
-) -> None:
-    """Draw mean (μ) on first line, median (x̄) on second line below with spacing."""
-    if len(vals) == 0:
-        return
-    mean_val = float(np.mean(vals))
-    med_val = float(np.median(vals))
-    dy = y_hi - y_lo
-    line_height = 0.07 * dy if dy > 0 else 0.0  # separation between mean and median
-    y_mean = y_lo + 0.09 * dy if dy > 0 else y_lo
-    y_median = y_mean - line_height
-    ax.text(pos, y_mean, r"$\mu$ = " + f"{mean_val:.{decimals}f}",
-            ha="center", va="bottom", fontsize=18, color="#333333", zorder=8)
-    ax.text(pos, y_median, r"$\bar{x}$ = " + f"{med_val:.{decimals}f}",
-            ha="center", va="bottom", fontsize=18, color="#333333", zorder=8)
+        # Mean diamond
+        ax.scatter([x], [mean_val], marker="D", s=10,
+                   color=MEAN_COLOR, zorder=6, linewidths=0.3, edgecolors="white")
 
 
 # ---------------------------------------------------------------------------
-# Annotation helpers  (n=, clipped-outlier counts)
+# Combined 1x3 panel figure
 # ---------------------------------------------------------------------------
 
-def _annotate_violin(
-    ax,
-    vals: np.ndarray,
-    pos: float,
-    y_lo: float,
-    y_hi: float,
-) -> None:
-    """n= below axis; +k / −k for values outside the visible y-range."""
-    if len(vals) == 0:
-        return
-
-    # n= — uses get_xaxis_transform() so y is in axes fraction
-    #ax.text(
-    #    pos, -0.08,
-    #    f"$n$={len(vals):,}",
-    #    ha="center", va="top",
-    #    fontsize=6.5, color="#555555",
-    #    transform=ax.get_xaxis_transform(),
-    #)
-
-    # Values outside visible range
-    n_above = int(np.sum(vals > y_hi))
-    n_below = int(np.sum(vals < y_lo))
-    if n_above > 0:
-        ax.text(pos, y_hi, f"+{n_above}",
-                ha="center", va="bottom",
-                fontsize=6.5, color=FLIER_COLOR, style="italic",
-                clip_on=False, zorder=8)
-    if n_below > 0:
-        ax.text(pos, y_lo, f"−{n_below}",
-                ha="center", va="top",
-                fontsize=6.5, color=FLIER_COLOR, style="italic",
-                clip_on=False, zorder=8)
-
-
-# ---------------------------------------------------------------------------
-# Config legend table  (same as box-plot script)
-# ---------------------------------------------------------------------------
-
-def _add_legend_table(fig, configs: List[Tuple[str, str, Path]]) -> None:
-    parts = [f"$\\mathbf{{{letter}}}$: {label}" for letter, label, _ in configs]
-    mid   = (len(parts) + 1) // 2
-    row1  = "    ".join(parts[:mid])
-    row2  = "    ".join(parts[mid:])
-    text  = row1 + ("\n" + row2 if row2 else "")
-    fig.text(0.5, 0.04, text,
-             ha="center", va="bottom",
-             fontsize=7.5, color="#333333", linespacing=1.6)
-
-
-# ---------------------------------------------------------------------------
-# Main plot function
-# ---------------------------------------------------------------------------
-
-def plot_violin_channel(
+def plot_combined(
     config_dfs: List[Tuple[str, str, pd.DataFrame]],
-    col: str,
-    metric_key: str,
-    channel: str,
     out_path: Path,
 ) -> None:
-    """One publication-ready violin figure for (metric, channel)."""
-    meta      = METRIC_META[metric_key]
-    color     = METRIC_COLORS[metric_key]
-    positions = np.arange(len(config_dfs))
-    letters   = [c[0] for c in config_dfs]
+    """Single 1×3 figure: one panel per metric, grouped boxes per channel."""
+    n_configs = len(config_dfs)
+    colors = CONFIG_COLORS[:n_configs]
 
-    data_list = [df[col].dropna().values for _, _, df in config_dfs]
+    fig, axes = plt.subplots(1, 3, figsize=(7.2, 2.6))
 
-    # Figure sizing — generous so violins never crowd the legend
-    fig_w = max(4.5, 1.6 * len(config_dfs) + 2.0)
-    fig, ax = plt.subplots(figsize=(fig_w, 3.5))
+    for ax, metric_key in zip(axes, METRICS):
+        meta = METRIC_META[metric_key]
 
-    # Robust y-limits computed before drawing
-    y_lo, y_hi = _robust_ylim(data_list, meta["ref_line"])
-    ax.set_ylim(y_lo, y_hi)
-    ax.set_xlim(-0.6, len(config_dfs) - 0.4)
+        all_data = []
+        for ch in CHANNELS:
+            col = f"{metric_key}_{ch}"
+            group = [df[col].dropna().values if col in df.columns else np.array([])
+                     for _, _, df in config_dfs]
+            all_data.append(group)
 
-    # Reference line
-    if meta["ref_line"] is not None:
-        ax.axhline(meta["ref_line"], color="#666666", ls=":", lw=0.9,
-                   zorder=1, label=meta["ref_label"])
+        # Y-limits from all data across channels for this metric
+        flat = np.concatenate([v for grp in all_data for v in grp if len(v) > 0])
+        if len(flat) > 0:
+            q1, q3 = np.percentile(flat, [25, 75])
+            iqr = q3 - q1 if q3 > q1 else 1.0
+            y_lo = q1 - 1.8 * iqr
+            y_hi = q3 + 1.8 * iqr
+            if meta["ref_line"] is not None:
+                y_lo = min(y_lo, meta["ref_line"] - 0.05 * iqr)
+            y_max_cap = meta.get("y_max")
+            if y_max_cap is not None:
+                y_hi = min(float(y_hi), float(y_max_cap))
+                if y_lo >= y_hi:
+                    y_lo = y_hi - 0.05
+            ax.set_ylim(y_lo, y_hi)
 
-    # Draw violins + inner stats + mean/median numbers
-    VIOLIN_WIDTH = min(0.7, 0.9 / max(len(config_dfs), 1))
-    decimals = 2 if metric_key == "psd_logl2" else 3
-    for pos, vals in zip(positions, data_list):
-        _draw_violin(ax, vals, pos, y_lo, y_hi, color, width=VIOLIN_WIDTH)
-        _draw_inner_stats(ax, vals, pos, y_lo, y_hi)
-        _draw_mean_median_labels(ax, vals, pos, y_lo, y_hi, decimals=decimals)
+        # Reference line
+        if meta["ref_line"] is not None:
+            ax.axhline(meta["ref_line"], color="#999999", ls=":", lw=0.5, zorder=1)
 
-    # Axes formatting (no legend)
-    ax.set_xticks(positions)
-    ax.set_xticklabels(letters, fontsize=20, fontweight="bold")
-    ax.set_xlabel("Configuration", labelpad=12, fontsize=18)
-    ax.set_ylabel(meta["ylabel"], labelpad=3, fontsize=18)
-    ax.set_title(meta["title_fmt"].format(ch=channel), pad=5, loc="left", fontsize=18)
-    ax.yaxis.set_major_locator(mpl_ticker.MaxNLocator(nbins=6))
+        # Draw grouped boxes
+        group_positions = np.arange(len(CHANNELS))
+        for gi, (ch, group) in enumerate(zip(CHANNELS, all_data)):
+            _draw_grouped_boxes(ax, group, group_positions[gi], colors)
 
-    # No config legend on figure; x-axis label "Configuration" only
-    fig.subplots_adjust(bottom=0.12, top=0.92, left=0.14, right=0.97)
+        ax.set_xticks(group_positions)
+        ax.set_xticklabels(CHANNELS, fontweight="bold")
+        ax.set_xlim(-0.5, len(CHANNELS) - 0.5)
+        ax.set_ylabel(meta["ylabel"], fontsize=9)
+        ax.yaxis.set_major_locator(mpl_ticker.MaxNLocator(nbins=8))
+
+    # Shared legend at top
+    handles = [mpatches.Patch(facecolor=colors[i], edgecolor=colors[i],
+                              alpha=0.55, label=config_dfs[i][0])
+               for i in range(n_configs)]
+    handles.append(plt.Line2D([0], [0], marker="D", color="w", markerfacecolor=MEAN_COLOR,
+                              markersize=4, label="Mean", linewidth=0))
+    fig.legend(handles=handles, loc="upper center",
+               bbox_to_anchor=(0.5, 1.0), ncol=n_configs + 1,
+               frameon=True, framealpha=0.95, edgecolor="#cccccc",
+               fontsize=9, handlelength=1.4, handletextpad=0.4,
+               columnspacing=1.2, borderpad=0.3)
+
+    fig.subplots_adjust(left=0.06, right=0.98, bottom=0.10, top=0.85, wspace=0.30)
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(out_path, dpi=300, bbox_inches="tight")
+    fig.savefig(out_path, bbox_inches="tight")
     plt.close(fig)
     print(f"  Saved  {out_path}")
 
@@ -375,14 +271,16 @@ def plot_violin_channel(
 
 def parse_args():
     p = argparse.ArgumentParser(
-        description="Violin plots from rollout CSVs",
+        description="Grouped box-plot figure from rollout CSVs",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     p.add_argument("--csv-dir",    default=None,
                    help="Directory to glob rollout_metrics*.csv from")
     p.add_argument("--csv",        nargs="*", default=None,
                    help="Explicit CSV paths (overrides --csv-dir)")
-    p.add_argument("--output-dir", default="violin_plots")
+    p.add_argument("--output-dir", default="metrics_plots")
+    p.add_argument("--output",     default=None,
+                   help="Output path for combined figure (default: <output-dir>/metrics_boxplot.pdf)")
     p.add_argument("--pattern",    default="rollout_metrics*.csv",
                    help="Glob pattern when using --csv-dir")
     p.add_argument("--no-summary", action="store_true",
@@ -407,7 +305,7 @@ def main():
     configs = collect_configs(csv_paths)
     print("Configurations found:")
     for letter, label, path in configs:
-        print(f"  {letter}: {label:20s}  ←  {path.name}")
+        print(f"  {letter}: {label:20s}  <-  {path.name}")
 
     config_dfs = [(letter, label, pd.read_csv(path))
                   for letter, label, path in configs]
@@ -415,20 +313,9 @@ def main():
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    print(f"\n── Violin plots ({len(METRICS)} metrics × {len(CHANNELS)} channels) ──────────")
-    for metric_key in METRICS:
-        for ch in CHANNELS:
-            col = f"{metric_key}_{ch}"
-            if not any(col in df.columns for _, _, df in config_dfs):
-                print(f"  [skip] {col} — column not found in any CSV")
-                continue
-            plot_violin_channel(
-                config_dfs=config_dfs,
-                col=col,
-                metric_key=metric_key,
-                channel=ch,
-                out_path=out_dir / f"violin_{col}.png",
-            )
+    out_path = Path(args.output) if args.output else out_dir / "metrics_boxplot.pdf"
+    print(f"\n-- Combined grouped box-plot figure --")
+    plot_combined(config_dfs, out_path)
 
     if not args.no_summary:
         rows = []
@@ -444,9 +331,9 @@ def main():
             rows.append(row)
         summary_path = out_dir / "summary.csv"
         pd.DataFrame(rows).to_csv(summary_path, index=False)
-        print(f"\n  Summary table → {summary_path}")
+        print(f"\n  Summary table -> {summary_path}")
 
-    print(f"\nDone — all figures in  {out_dir.absolute()}")
+    print(f"\nDone -- figure saved to {out_path}")
 
 
 if __name__ == "__main__":

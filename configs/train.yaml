@@ -1,16 +1,13 @@
-# Training config for GPT on seismic waveforms
 # Run: python main.py fit --config configs/train.yaml
-# Data must provide x, y (time tokens and target).
 
 seed_everything: 42
 trainer:
-  max_epochs: 10
+  max_epochs: 50
   accelerator: "gpu"
   devices: "-1"
   strategy: "auto"
-  precision: "bf16-mixed" # bf16-mixed or 32-true
-  accumulate_grad_batches: 2
-  #gradient_clip_val: 1.0
+  precision: "bf16-mixed"
+  gradient_clip_val: 1.0
   callbacks:
     - class_path: lightning.pytorch.callbacks.ModelCheckpoint
       init_args:
@@ -24,74 +21,62 @@ trainer:
       init_args:
         monitor: "val_loss"
         min_delta: 0.0
-        patience: 5
+        patience: 10
         verbose: false
   logger:
     - class_path: lightning.pytorch.loggers.TensorBoardLogger
       init_args:
         save_dir: "."
-        name: "logs"   
+        name: "logs"
 
 model:
   class_path: models.lightning_module.GPTLightning
   init_args:
-    # GPT architecture (must match data kernel_size)
     in_channels: 3
     kernel_size: 16
-    num_tokens: 128
-    d_model: 256
-    num_layers: 3
+    num_tokens: 320
+    d_model: 512
     num_heads: 8
-    num_enc_layers: 16
+    num_enc_layers: 8
     dropout: 0.1
     max_len: 5000
     dim_feedforward_multiplier: 4
-    # Token causal CNN embedding
     token_cnn_kernel: 5
     token_cnn_layers: 3
     token_cnn_dilation_growth: 2
     token_cnn_dropout: 0.0
-    # Post-head stitcher
-    use_stitcher: true
-    stitcher_hidden: 128
-    stitcher_kernel: 5
-    stitcher_layers: 2
-    stitcher_dropout: 0.0
-    # Loss
-    time_loss: "mse"
+    time_loss: "log_cosh"
+    temporal_delta_weight: 0.05
+    stft_enable: true
+    stft_weight: 0.05
+    stft_n_ffts: [128, 256, 512]
+    lambda_coherence: 0.1
     lr: 1.0e-4
-    # --- NEW: frequency embedding & gate (rollout stability) ---
-    freq_embed_type: "mlp"          # "mlp" (lightweight, default) or "conv" (legacy)
-    freq_keep_bins: 8               # F bins per channel (must match data)
-    freq_gate: true                 # learned sigmoid gate on freq contribution
-    freq_norm: "l2"               # "none" | "mean" | "l2" (must match data)
-    freq_log1p: true                # must match data
-    # --- NEW: scheduled sampling (exposure bias reduction) ---
-    ss_enable: false                # set true to enable AR unroll in training
-    ss_unroll_tokens: 8             # U: number of closed-loop AR steps
-    ss_start_prob: 0.0              # initial prob of using predicted token
-    ss_end_prob: 0.5                # final prob after warmup
-    ss_warmup_steps: 5000           # linear ramp steps
-    ss_future_only_loss: true       # loss only on unrolled predictions
-    ss_bias_window_frac: 0.4        # bias starts toward last 40% of sequence
-    # Optional LR scheduler (omit or set scheduler: null to disable)
     scheduler: CosineAnnealingWarmRestarts
-    scheduler_T_0: 5
+    # With lr_warmup_steps > 0, cosine uses optimizer steps; T_0 = restart period in steps (10 is very short—raise if LR oscillates too fast).
+    scheduler_T_0: 10
     scheduler_T_mult: 2
     scheduler_eta_min: 1.0e-5
-    lr_scheduler_interval: epoch
+    lr_warmup_steps: 1000
+    lr_scheduler_interval: step
     lr_scheduler_frequency: 1
     lr_scheduler_monitor: null
+    use_torch_compile: false
+    compile_mode: "reduce-overhead"
+    num_pred_horizons: 4
+    mtp_weight_decay: 0.6
 
 data:
-  class_path: data_handling.data_handling.SeismicDataModule
+  class_path: data.data_handling.SeismicDataModule
   init_args:
-    data_dir: /mnt/d/waleed/Seismology/simulation/clean/SobolDataset/Regional
+    data_dir: /mnt/d/waleed/Seismology/simulation/clean/SobolDataset
     kernel_size: 16
     stride: 16
-    batch_size: 96
+    batch_size: 32
     num_workers: 16
-    num_tokens: 128
+    num_tokens: 320
     normalize: true
-    # --- NEW: per-token spectrum normalization (rollout parity) ---
-    freq_norm: "l2"               # "none" | "mean" | "l2"
+    random_shift: true
+    num_pred_horizons: 4
+    aug_polarity_flip: true
+    aug_channel_swap: true

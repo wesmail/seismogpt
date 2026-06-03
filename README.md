@@ -1,222 +1,239 @@
 # SeismoGPT
 
-**Autoregressive seismic waveform prediction** — a foundation-style model for generating or predicting seismic waveforms in the time domain.
+Official code repository for the paper:
+
+**[Data-Driven Forecasting of three-Component Seismograms Using Transformer Architectures](https://arxiv.org/abs/2606.02912v1)**  
+Waleed Esmail, Stuart Russell, Jana Klinge, Alexander Kappes, Christine Thomas — [arXiv:2606.02912v1](https://arxiv.org/abs/2606.02912v1) (2026)
+
+**Autoregressive seismic waveform prediction** — a causal RoPE transformer over Z/N/E waveform tokens, trained with PyTorch Lightning. The model forecasts three-component seismograms in the time domain from context starting at the P-wave arrival through a distance-normalized window beyond the S-wave arrival, then autoregressively continues the motion (evaluation configurations **A**, **B**, and **C** in the paper).
+
+**Pre-trained Phase 1 weights:** [wesmail/SeismoGPT on Hugging Face](https://huggingface.co/wesmail/SeismoGPT)
 
 ---
 
-## Repository structure
+## Repository layout
 
 ```
 .
-├── configs
-│   └── train.yaml
-├── data_generation
+├── configs/
+│   └── train.yaml              # LightningCLI training config
+├── data/
+│   └── data_handling.py        # SeisBench dataset + SeismicDataModule
+├── data_generation/
 │   ├── cmt.py
-│   └── waveform_generator.py
-├── data_handling
-│   └── data_handling.py
-├── main.py
-├── models
+│   └── waveform_generator.py   # Synthetic training data (Instaseis + ObsPy)
+├── models/
 │   ├── lightning_module.py
 │   └── models.py
-└── quality_assurance
-    ├── plot_global_metrics_from_csv.py
-    ├── plot_rollout_metrics.py
-    ├── testset_rollout.py
-    └── utils.py
+├── quality_assurance/          # Test-set rollouts and metric figures
+│   ├── efficient_rollout.py    # Fast metrics-only rollout → CSV
+│   ├── plot_global_metrics_from_csv.py
+│   ├── plot_ncc_corner.py      # NCC / SRR / PSD vs Δ, depth, Mw
+│   ├── plot_ncc_heatmap.py
+│   ├── make_paper_figures.py
+│   ├── rollout_filtered_catalog_plots.py
+│   └── utils.py
+├── scripts/
+│   └── download_seismogpt.sh   # Fetch checkpoint from Hugging Face
+├── main.py
+└── run_evaluation_abc.sh       # Configs A/B/C rollout + plots (one command)
 ```
 
 ---
 
-## Data generation: install and usage
+## Quick start: model + evaluation
 
-The `data_generation` module builds Sobol-sampled synthetic seismograms for training SeismoGPT. It uses **Instaseis** (Green’s function DB) and **ObsPy** for propagation, plus **SeisBench** for writing datasets.
-
-### Installing dependencies
-
-From the project root, use a dedicated environment (recommended):
-
-**Option A — Conda (recommended for ObsPy + Instaseis)**
+### 1. Install dependencies
 
 ```bash
 conda create -n seismogpt python=3.10
 conda activate seismogpt
-conda install -c conda-forge obspy instaseis
-pip install numpy scipy tqdm seisbench
+pip install torch lightning seisbench pyyaml matplotlib scipy tqdm h5py
+pip install huggingface_hub   # optional, for downloading weights
 ```
 
-**Option B — pip only**
+### 2. Get the trained model
+
+**Option A — Hugging Face (recommended)**
 
 ```bash
-python -m venv .venv
-source .venv/bin/activate   # Windows: .venv\Scripts\activate
-pip install numpy scipy tqdm obspy instaseis seisbench
+# from repository root
+./scripts/download_seismogpt.sh
+# → phase1/epoch=12-step=633750.ckpt
 ```
 
-You also need an **Instaseis database** (precomputed Green’s functions). The script’s default path is `--db /scratch/tmp/wesmail/ak135f_2s/`. Use your own DB path or a [Syngine](https://docs.obspy.org/packages/obspy.clients.syngine.html) URI. Public DBs can be built with Instaseis or downloaded from community sources.
-
-### Running the waveform generator
-
-Run from the **`data_generation`** directory so that the local `cmt` module is importable:
+Or:
 
 ```bash
-cd data_generation
-python waveform_generator.py --db /path/to/your/instaseis_db --num_events 5000 --out seisbench_data
+pip install huggingface_hub
+huggingface-cli download wesmail/SeismoGPT \
+  epoch=12-step=633750.ckpt train_phase1_logcosh.yaml \
+  --local-dir phase1
 ```
 
-**Main arguments:**
+**Option B — local checkpoint**
 
-| Argument | Default | Description |
-|----------|---------|-------------|
-| `--db` | `/scratch/tmp/wesmail/ak135f_2s/` | Instaseis DB path or Syngine URI |
-| `--seimic_model` | `prem` | TauP model: `prem`, `ak135`, or `iasp91` |
-| `--num_events` | `5000` | Number of sources to simulate |
-| `--receivers_per_event` | `2` | Receivers per source |
-| `--out` | `seisbench_data` | Output directory (SeisBench-style dataset) |
-| `--postfix` | `""` | Optional postfix for the output dir (e.g. `01`) |
-| `--min_depth`, `--max_depth` | `5.0`, `20.0` | Source depth range (km) |
-| `--min_dist`, `--max_dist` | `10.0`, `40.0` | Epicentral distance range (degrees) |
-| `--mw_min`, `--mw_max` | `3.0`, `7.0` | Moment magnitude range |
-| `--components` | `ZNE` | Components to export (e.g. `ZNE`, `Z`) |
-| `--fmin`, `--fmax` | `0.02`, `1.0` | Bandpass band (Hz) |
-| `--seed` | `42` | Random seed for Sobol sampling |
+Place your `.ckpt` anywhere and pass `--checkpoint /path/to/file.ckpt` to the scripts below.
 
-**Example (custom geometry and output):**
+**Load in Python** (from repository root):
+
+```python
+from models.lightning_module import GPTLightning
+
+model = GPTLightning.load_from_checkpoint("phase1/epoch=12-step=633750.ckpt")
+model.eval()
+```
+
+Hub page: [https://huggingface.co/wesmail/SeismoGPT](https://huggingface.co/wesmail/SeismoGPT)
+
+### 3. Run paper configurations A, B, C
+
+You need a **SeisBench-style test dataset** (`--data-dir`) and a **metadata CSV** (`--metadata-csv`) with columns used for plotting (e.g. `distance_deg`, `src_depth_km`, `Mw` — see plotting scripts for defaults).
+
+| Config | Context ratio | Prediction horizon | Output CSV |
+|--------|---------------|--------------------|------------|
+| **A** | 1 × (S−P) | 120 s | `rollout_metrics_1_120.csv` |
+| **B** | 1 × (S−P) | 240 s | `rollout_metrics_1_240.csv` |
+| **C** | 2 × (S−P) | 240 s | `rollout_metrics_2_240.csv` |
+
+**Full pipeline** (rollouts + global box plots + physics corner plots):
 
 ```bash
-cd data_generation
-python waveform_generator.py \
-  --db /data/instaseis/ak135f_2s \
-  --num_events 10000 \
-  --receivers_per_event 4 \
-  --min_depth 0 --max_depth 50 \
-  --min_dist 1 --max_dist 15 \
-  --out my_dataset \
-  --postfix regional
+./run_evaluation_abc.sh \
+  --download-hf \
+  --data-dir /path/to/PaperTestSet \
+  --metadata-csv /path/to/metadata.csv \
+  --output-dir results/evaluation_abc
 ```
 
-Output is written under `my_dataset_regional/` (or `seisbench_data` if no `--out`/`--postfix`) in SeisBench format, ready for use with the training data module (e.g. `data_handling.SeismicDataModule`).
+With a local checkpoint:
+
+```bash
+./run_evaluation_abc.sh \
+  --data-dir /path/to/PaperTestSet \
+  --metadata-csv /path/to/metadata.csv \
+  --checkpoint phase1/epoch=12-step=633750.ckpt \
+  --output-dir results/evaluation_abc
+```
+
+By default, each configuration evaluates **1000** events (`-n 1000`). Pass a larger `-n` or set `N_SAMPLES` to cover more of the test set.
+
+**Outputs:**
+
+| Path | Content |
+|------|---------|
+| `results/evaluation_abc/csv/rollout_metrics_*.csv` | Per-item NCC, SRR (`snr_db_*`), PSD log-L², … |
+| `results/evaluation_abc/figures/global/metrics_boxplot_ABC.pdf` | Grouped NCC / SRR / PSD by channel (A vs B vs C) |
+| `results/evaluation_abc/figures/corner/*_corner_Z.pdf` | Median NCC / SRR / PSD on Δ–depth, Δ–Mw, depth–Mw planes |
+
+Useful flags: `--half` (GPU fp16), `--skip-psd` (faster rollouts), `--skip-rollout` / `--skip-plots`, `--corner-channel N|E|global`.
 
 ---
 
-## Training a model
+## Quality assurance (manual steps)
 
-Training uses **PyTorch** and **PyTorch Lightning** (Lightning CLIs for config-driven runs). Data is expected in SeisBench format (e.g. from the data generation step above).
+### Rollout → CSV (single configuration)
 
-### Installing dependencies
-
-From the project root, in a dedicated environment:
-
-**If you already have the data-generation env**, add the training stack:
+From repository root:
 
 ```bash
-conda activate seismogpt   # or your venv
-pip install torch lightning h5py
+python quality_assurance/efficient_rollout.py \
+  --checkpoint phase1/epoch=12-step=633750.ckpt \
+  --data_dir /path/to/PaperTestSet \
+  --context_ratio 1 \
+  --future_secs 120 \
+  --mode free \
+  -n 2000 \
+  --csv rollout_metrics_1_120.csv
 ```
 
-**New env for training only:**
+Use `--context_ratio` and `--future_secs` for B (1, 240) and C (2, 240). Name CSVs `rollout_metrics_<ratio>_<future>.csv` so `plot_global_metrics_from_csv.py` labels configs A/B/C automatically.
+
+### Global metrics figure
 
 ```bash
-conda create -n seismogpt-train python=3.10
-conda activate seismogpt-train
-pip install torch lightning numpy scipy h5py seisbench
+python quality_assurance/plot_global_metrics_from_csv.py \
+  --csv results/evaluation_abc/csv/rollout_metrics_1_120.csv \
+        results/evaluation_abc/csv/rollout_metrics_1_240.csv \
+        results/evaluation_abc/csv/rollout_metrics_2_240.csv \
+  --output results/evaluation_abc/figures/global/metrics_boxplot_ABC.pdf
 ```
 
-For GPU training, install a CUDA-enabled PyTorch build (see [pytorch.org](https://pytorch.org/get-started/locally/) for your CUDA version).
+### Physics corner (NCC, SRR, PSD vs geometry)
 
-### Configuring the run
+```bash
+python quality_assurance/plot_ncc_corner.py \
+  --csv results/evaluation_abc/csv/rollout_metrics_1_120.csv \
+  --metadata-csv /path/to/metadata.csv \
+  --metrics ncc,snr,psd_logl2 \
+  --channel Z \
+  --output results/evaluation_abc/figures/corner/rollout_metrics_1_120_corner_Z.pdf
+```
 
-All training and data options are set in **`configs/train.yaml`**.
+Repeat per CSV or use `run_evaluation_abc.sh`.
 
-1. **Set the data path**  
-   Under `data.init_args`, set `data_dir` to the **absolute path** of your SeisBench-style dataset (the directory that contains the waveform data and metadata):
+### Other QA scripts
 
-   ```yaml
-   data:
-     class_path: data_handling.data_handling.SeismicDataModule
-     init_args:
-       data_dir: /path/to/your/seisbench_dataset   # <-- change this
-       kernel_size: 16
-       stride: 16
-       batch_size: 96
-       # ...
-   ```
+| Script | Role |
+|--------|------|
+| `plot_ncc_heatmap.py` | Median NCC heatmap on distance × depth |
+| `make_paper_figures.py` | Fig. 7 horizon series, contrast successes, multi-event panels |
+| `rollout_filtered_catalog_plots.py` | Filtered low/high-NCC catalog PDFs |
 
-2. **Adjust other parameters (optional)**  
-   In the same file you can change:
-   - **trainer**: `max_epochs`, `accelerator`, `devices`, `precision`, `accumulate_grad_batches`, etc.
-   - **model**: architecture (`d_model`, `num_layers`, `num_heads`, `kernel_size`, `num_tokens`, …), loss (`time_loss`), learning rate (`lr`), scheduler, scheduled-sampling options.
-   - **data**: `batch_size`, `num_workers`, `kernel_size`, `stride`, `num_tokens`, `normalize`, `freq_norm`.
+---
 
-   Keep `kernel_size`, `num_tokens`, and `freq_norm` (and related model options) consistent between data and model.
+## Data generation
 
-### Running training
+Synthetic training data via **Instaseis** + **ObsPy** + **SeisBench** export.
 
-From the **project root** (so `models` and `data_handling` are on the Python path):
+```bash
+cd data_generation
+conda install -c conda-forge obspy instaseis
+pip install numpy scipy tqdm seisbench
+
+python waveform_generator.py \
+  --db /path/to/instaseis_db \
+  --num_events 5000 \
+  --out seisbench_data
+```
+
+See `data_generation/waveform_generator.py --help` for depth, distance, and magnitude ranges.
+
+---
+
+## Training
+
+Edit `configs/train.yaml` — set `data.init_args.data_dir` to your SeisBench dataset.
 
 ```bash
 python main.py fit --config configs/train.yaml
 ```
 
-Checkpoints and TensorBoard logs are written according to `trainer.callbacks` and `trainer.logger` in the config (default: checkpoints and `./logs/`).
+Training uses `data.data_handling.SeismicDataModule` (not a separate top-level `data_handling` package). Run from **repository root** so `models` and `data` import correctly.
+
+Phase 1 hyperparameters for the published checkpoint are also on Hugging Face as `train_phase1_logcosh.yaml`.
 
 ---
 
-## Quality assurance
+## Citation
 
-The **`quality_assurance`** folder contains scripts to evaluate a trained model with autoregressive rollouts and to produce publication-ready metric plots.
+If you use this code or the published weights, please cite:
 
-| File | Purpose |
-|------|--------|
-| **`testset_rollout.py`** | Runs autoregressive (or teacher-forced) rollout on a test set: loads a checkpoint, runs the model on context windows, and predicts the future. Writes per-sample metrics (SNR, NCC, PSD, forecast skill) to a CSV. |
-| **`plot_rollout_metrics.py`** | Reads the rollout CSV and builds plots of metrics vs. metadata (e.g. distance, depth, magnitude): histograms, hexbins, and summary figures. |
-| **`plot_global_metrics_from_csv.py`** | Builds global metric summaries (e.g. violin/box plots) from one or more rollout CSV files for cross-run comparison. |
-| **`utils.py`** | Shared metric helpers (SNR, normalized cross-correlation, PSD metrics, best-shift alignment). |
-| **`run_rollout_and_plot.sh`** | One-shot script: runs `testset_rollout.py` then `plot_rollout_metrics.py` with the same CSV. |
-
-We provide a trained checkpoint at **`quality_assurance/best.ckpt`** so you can run evaluation without training first.
-
-### Running evaluation with the trained model
-
-From the **`quality_assurance`** directory, use the bash script. You must pass the dataset path, the checkpoint path, and a metadata CSV (used for plotting). The script runs the rollout and then generates the rollout metrics plots.
-
-**Minimal run** (only required arguments; other options use defaults):
-
-```bash
-cd quality_assurance
-./run_rollout_and_plot.sh \
-  --data_dir /path/to/dataset \
-  --checkpoint "logs/version_0/checkpoints/epoch=25-step=121888.ckpt" \
-  --metadata-csv /path/to/metadata_data_50.csv
+```bibtex
+@article{esmail2026seismogpt,
+  title   = {Data-Driven Forecasting of three-Component Seismograms Using Transformer Architectures},
+  author  = {Esmail, Waleed and Russell, Stuart and Klinge, Jana and Kappes, Alexander and Thomas, Christine},
+  journal = {arXiv preprint arXiv:2606.02912},
+  year    = {2026},
+  eprint  = {2606.02912},
+  archivePrefix = {arXiv},
+  primaryClass  = {astro-ph.IM},
+  url     = {https://arxiv.org/abs/2606.02912}
+}
 ```
 
-**Using the provided checkpoint:**
+Paper: [https://arxiv.org/abs/2606.02912v1](https://arxiv.org/abs/2606.02912v1)
 
-```bash
-cd quality_assurance
-./run_rollout_and_plot.sh \
-  --data_dir /path/to/dataset \
-  --checkpoint best.ckpt \
-  --metadata-csv /path/to/metadata_data_50.csv
-```
+## License
 
-**Full example** (override rollout length, sample count, and output paths):
-
-```bash
-./run_rollout_and_plot.sh \
-  --data_dir /path/to/dataset \
-  --checkpoint my.ckpt \
-  --metadata-csv /path/to/metadata.csv \
-  --context_secs 60 \
-  --future_secs 120 \
-  --num_samples 5000 \
-  --csv rollout_metrics_earlycoda.csv \
-  --output-dir metrics_plots_earlycoda/
-```
-
-**Required arguments:** `--data_dir` (SeisBench dataset root), `--checkpoint` (`.ckpt` file), `--metadata-csv` (CSV used by the plotting step).
-
-**Optional (rollout):** `--kernel_size`, `--num_tokens`, `--context_secs`, `--future_secs`, `--num_samples`, `--csv`, `--mode` (`free` or `teacher`), `--output` (rollout figure), `--seed`.  
-**Optional (plots):** `--output-dir` (defaults to `metrics_plots_<csv_stem>/`).
-
-The script writes the metrics CSV (e.g. `rollout_metrics_longhorizon.csv`) and saves figures into the chosen output directory.
+This repository is released under the [MIT License](LICENSE). The Hugging Face model [wesmail/SeismoGPT](https://huggingface.co/wesmail/SeismoGPT) is also distributed under MIT.

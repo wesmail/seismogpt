@@ -1,20 +1,85 @@
 """
 PyTorch Lightning module for training the GPT model (time-domain only) with
-time-domain loss (MSE/L1) and multi-resolution STFT loss.
+time-domain loss (MSE/L1/log-cosh/Gaussian or Laplace or Student-t NLL) and
+optional multi-resolution STFT loss.
 
-OPTIMIZATIONS:
-- Flash Attention enabled (via is_causal flag in model)
-- Optional torch.compile() for additional speedup
-- Flash Attention status logging at init
+Flash Attention via is_causal; optional torch.compile.
+
 """
-from typing import Any, Dict, Optional
+import math
+from typing import Any, Dict, FrozenSet, Optional
 
 import torch
 import torch.nn.functional as F
 from lightning.pytorch import LightningModule
+from lightning.pytorch.callbacks import Callback
 
 from models.models import GPT, MultiResSTFTLoss, print_flash_attention_status, compile_model
-from data_handling.data_handling import freq_features_from_tokens
+
+# Gaussian ``nll``, Laplace ``nll_laplace``, and Student-t ``nll_studentt`` share 2*C outputs.
+_PROBABILISTIC_TIME_LOSSES: FrozenSet[str] = frozenset(
+    {"nll", "nll_laplace", "nll_studentt"}
+)
+
+
+def _is_sigma_param(name: str) -> bool:
+    return "shared_sigma_head" in name
+
+
+class TrunkDriftMonitor(Callback):
+    """Logs trunk drift from a reference checkpoint (excluding sigma-head parameters)."""
+
+    def __init__(self, reference_ckpt_path: str):
+        super().__init__()
+        self.reference_ckpt_path = reference_ckpt_path
+        self._reference_trunk: dict[str, torch.Tensor] = {}
+        self._warned = False
+
+    def on_fit_start(self, trainer, pl_module: LightningModule) -> None:
+        ckpt = torch.load(self.reference_ckpt_path, map_location="cpu")
+        state = ckpt.get("state_dict", ckpt)
+        ref = {}
+        missing = 0
+        for name, _p in pl_module.named_parameters():
+            if _is_sigma_param(name):
+                continue
+            if name in state:
+                ref[name] = state[name].detach().cpu().float()
+            else:
+                missing += 1
+        self._reference_trunk = ref
+        if trainer.is_global_zero:
+            print(
+                f"[TrunkDriftMonitor] loaded {len(ref)} trunk tensors from reference ckpt; "
+                f"missing={missing}"
+            )
+
+    def on_train_epoch_end(self, trainer, pl_module: LightningModule) -> None:
+        if not self._reference_trunk:
+            return
+        diff_sq = 0.0
+        ref_sq = 0.0
+        with torch.no_grad():
+            for name, p in pl_module.named_parameters():
+                if _is_sigma_param(name):
+                    continue
+                ref = self._reference_trunk.get(name, None)
+                if ref is None:
+                    continue
+                cur = p.detach().cpu().float()
+                d = (cur - ref).pow(2).sum().item()
+                r = ref.pow(2).sum().item()
+                diff_sq += d
+                ref_sq += r
+        l2 = float(math.sqrt(max(diff_sq, 0.0)))
+        rel = float(l2 / (math.sqrt(max(ref_sq, 0.0)) + 1e-12))
+        pl_module.log("trunk_l2_drift", l2, on_epoch=True, sync_dist=True)
+        pl_module.log("trunk_rel_drift", rel, on_epoch=True, sync_dist=True)
+        if trainer.is_global_zero and trainer.current_epoch <= 1 and rel > 0.05 and not self._warned:
+            print(
+                f"[TrunkDriftMonitor][warn] trunk_rel_drift={rel:.4f} > 0.05 within first 2 epochs."
+            )
+            self._warned = True
 
 # =============================================================================
 # Log-Cosh Loss
@@ -30,6 +95,17 @@ class GPTLightning(LightningModule):
     """
     Lightning module for time-only GPT: takes x (time tokens) and y (time target),
     returns predictions and computes time + STFT loss.
+
+    ``time_loss`` options:
+        ``mse``, ``l1``, ``log_cosh`` — deterministic 1×C output.
+        ``nll`` — Gaussian negative log-likelihood (backward-compatible name for Gaussian).
+        ``nll_laplace`` — Laplace NLL; try first if residuals look heavy-tailed vs Gaussian.
+        ``nll_studentt`` — Student-t NLL with fixed ``studentt_df``.
+
+    The head still outputs 2×C channels when probabilistic; ``nll_logvar_min`` /
+    ``nll_logvar_max`` clamp the learned scale (σ, b, or s) via
+    ``exp(0.5 * min)`` … ``exp(0.5 * max)``. Recommended settings when retuning:
+    ``nll_logvar_min: -12.0``, ``nll_logvar_max: 3.0``.
     """
 
     def __init__(
@@ -39,7 +115,6 @@ class GPTLightning(LightningModule):
         kernel_size: int = 16,
         num_tokens: int = 256,
         d_model: int = 128,
-        num_layers: int = 3,
         num_heads: int = 2,
         num_enc_layers: int = 2,
         dropout: float = 0.1,
@@ -50,31 +125,20 @@ class GPTLightning(LightningModule):
         token_cnn_layers: int = 4,
         token_cnn_dilation_growth: int = 2,
         token_cnn_dropout: float = 0.0,
-        # Post-head stitcher (smooths predictions over sample axis)
-        use_stitcher: bool = True,
-        stitcher_hidden: int = 64,
-        stitcher_kernel: int = 9,
-        stitcher_layers: int = 4,
-        stitcher_dropout: float = 0.0,
-        # Loss
+        # Loss — see class docstring for ``time_loss`` options.
         time_loss: str = "l1",
-        fusion_type: str = "cross_attention",
+        # Optional token-to-token temporal consistency (default OFF).
+        temporal_delta_weight: float = 0.0,
+        # Scale-parameter bounds (interpretation of kwarg names unchanged): for all
+        # probabilistic losses (Gaussian σ, Laplace scale b, Student-t scale s),
+        #   s_min = exp(0.5 * nll_logvar_min),  s_max = exp(0.5 * nll_logvar_max).
+        # Defaults preserve backward compatibility; for a lower floor on scale (reducing
+        # σ-collapse / stuck-at-min behavior), try nll_logvar_min: -12.0 and nll_logvar_max: 3.0.
+        nll_logvar_min: float = -8.0,
+        nll_logvar_max: float = 4.0,
+        # Fixed ν for Student-t NLL (``time_loss == "nll_studentt"`` only); must be > 2.
+        studentt_df: float = 4.0,
         lr: float = 1e-4,
-        # --- NEW: frequency embedding / gate config ---
-        freq_embed_type: str = "mlp",       # "mlp" or "conv" (legacy)
-        freq_keep_bins: int = 8,            # F bins per channel
-        freq_gate: bool = True,             # learned gate on freq branch
-        # --- NEW: per-token spectrum normalization (must match dataset) ---
-        freq_norm: str = "none",            # "none" | "mean" | "l2"
-        freq_log1p: bool = True,            # log(1+|FFT|) — must match dataset
-        # --- NEW: scheduled sampling for rollout stability ---
-        ss_enable: bool = False,            # enable scheduled sampling unroll
-        ss_unroll_tokens: int = 8,          # U: number of AR unroll steps
-        ss_start_prob: float = 0.0,         # initial probability of using predicted token
-        ss_end_prob: float = 0.5,           # final probability
-        ss_warmup_steps: int = 5000,        # steps to linearly ramp from start to end
-        ss_future_only_loss: bool = True,   # only compute loss on unrolled predictions
-        ss_bias_window_frac: float = 0.4,   # fraction of T to bias start toward end
         # Optional LR scheduler (flat args for CLI; omit scheduler or set null = no scheduler)
         scheduler: Optional[str] = None,
         scheduler_T_0: int = 5,
@@ -83,16 +147,59 @@ class GPTLightning(LightningModule):
         lr_scheduler_interval: str = "epoch",
         lr_scheduler_frequency: int = 1,
         lr_scheduler_monitor: Optional[str] = None,
+        # Optional parameter-group LR split for stage-2 probabilistic fine-tuning.
+        # trunk LR = lr * lr_trunk_multiplier (all params except shared_sigma_head).
+        lr_sigma_head: float = 3e-4,
+        lr_trunk_multiplier: float = 1.0,
+        # Optional warm-start protection: freeze trunk for first N epochs, train sigma head only.
+        freeze_trunk_epochs: int = 0,
+        # Linear LR warmup in **optimizer steps** before ``CosineAnnealingWarmRestarts``; 0 = off.
+        # Uses ``interval: step``; ``scheduler_T_0`` / ``T_mult`` apply in **optimizer steps**.
+        lr_warmup_steps: int = 0,
         # NEW: torch.compile() options
         use_torch_compile: bool = False,
         compile_mode: str = "reduce-overhead",
+        # ── Multi-step prediction (MTP) ───────────────────────────────────
+        # H prediction heads trained simultaneously on the same encoder output.
+        # Head 0 (horizon-1) is the only head used at inference.
+        # Auxiliary heads (h=2..H) force the encoder to represent long-range
+        # structure — especially surface wave dispersion at large distances.
+        # Weight for horizon h = mtp_weight_decay^(h-1): 1.0, 0.5, 0.25, ...
+        num_pred_horizons: int = 1,     # H; set 1 to disable MTP
+        mtp_weight_decay:  float = 0.5, # exponential decay of horizon weights
+        # ── Multi-resolution STFT magnitude loss ───────────────────────────
+        stft_enable: bool = False,
+        stft_weight: float = 0.1,
+        stft_n_ffts: tuple[int, ...] = (256, 1024, 4096),
+        # MTP only: STFT magnitude loss on concat(pred_h, pred_{h+1}) vs concat(y_h, y_{h+1}).
+        lambda_coherence: float = 0.1,
+        # When False, load_state_dict from --ckpt_path is non-strict (needed for
+        # deterministic pretrain → NLL finetune: new ``shared_sigma_head`` weights missing in ckpt).
+        checkpoint_load_strict: bool = True,
+        **kwargs,
     ):
         super().__init__()
-        self.save_hyperparameters()
-        
-        if time_loss not in ("mse", "l1", "log_cosh"):
-            raise ValueError("time_loss must be 'mse', 'l1', or 'log_cosh'")
+        self.save_hyperparameters(ignore=("kwargs",))
+        if not checkpoint_load_strict:
+            self.strict_loading = False
+
+        allowed = ("mse", "l1", "log_cosh", "nll", "nll_laplace", "nll_studentt")
+        if time_loss not in allowed:
+            raise ValueError(
+                "time_loss must be one of 'mse', 'l1', 'log_cosh', 'nll', "
+                "'nll_laplace', 'nll_studentt'"
+            )
+        # Same 2×C output head fits Gaussian, Laplace, and Student-t; only the loss formula changes.
+        # Loading a Gaussian ``nll`` checkpoint into ``nll_laplace`` / ``nll_studentt`` is shape-compatible.
+        # Loading a deterministic (1×C) checkpoint into any probabilistic mode still needs
+        # ``checkpoint_load_strict=False`` (missing sigma head keys).
         self.time_loss = time_loss
+        self.temporal_delta_weight = float(temporal_delta_weight)
+        self.nll_logvar_min = float(nll_logvar_min)
+        self.nll_logvar_max = float(nll_logvar_max)
+        self.studentt_df = float(studentt_df)
+        if self.studentt_df <= 2.0:
+            raise ValueError(f"studentt_df must be > 2.0, got {self.studentt_df}")
 
         # Print Flash Attention status at initialization
         if torch.cuda.is_available():
@@ -103,7 +210,6 @@ class GPTLightning(LightningModule):
             kernel_size=kernel_size,
             num_tokens=num_tokens,
             d_model=d_model,
-            num_layers=num_layers,
             num_heads=num_heads,
             num_enc_layers=num_enc_layers,
             dropout=dropout,
@@ -113,16 +219,8 @@ class GPTLightning(LightningModule):
             token_cnn_layers=token_cnn_layers,
             token_cnn_dilation_growth=token_cnn_dilation_growth,
             token_cnn_dropout=token_cnn_dropout,
-            use_stitcher=use_stitcher,
-            stitcher_hidden=stitcher_hidden,
-            stitcher_kernel=stitcher_kernel,
-            stitcher_layers=stitcher_layers,
-            stitcher_dropout=stitcher_dropout,
-            fusion_type=fusion_type,
-            # --- NEW ---
-            freq_embed_type=freq_embed_type,
-            freq_keep_bins=freq_keep_bins,
-            freq_gate=freq_gate,
+            num_pred_horizons=num_pred_horizons,
+            probabilistic_output=(self.time_loss in _PROBABILISTIC_TIME_LOSSES),
         )
         
         # Optional: torch.compile() for additional speedup (PyTorch 2.0+)
@@ -138,225 +236,345 @@ class GPTLightning(LightningModule):
         self.lr_scheduler_interval = lr_scheduler_interval
         self.lr_scheduler_frequency = lr_scheduler_frequency
         self.lr_scheduler_monitor = lr_scheduler_monitor
+        self.lr_sigma_head = float(lr_sigma_head)
+        self.lr_trunk_multiplier = float(lr_trunk_multiplier)
+        self.freeze_trunk_epochs = int(freeze_trunk_epochs)
+        self._trunk_frozen = False
 
         # Log-Cosh Loss
         self.log_cosh_loss = LogCoshLoss()
 
-        # Scheduled sampling config (stored for use in training_step)
-        self.ss_enable = ss_enable
-        self.ss_unroll_tokens = ss_unroll_tokens
-        self.ss_start_prob = ss_start_prob
-        self.ss_end_prob = ss_end_prob
-        self.ss_warmup_steps = ss_warmup_steps
-        self.ss_future_only_loss = ss_future_only_loss
-        self.ss_bias_window_frac = ss_bias_window_frac
-        # Freq feature config needed to recompute x_freq during unroll
-        self.freq_norm = freq_norm
-        self.freq_log1p = freq_log1p
-        self.freq_keep_bins = freq_keep_bins
+        # Multi-resolution STFT magnitude loss (optional)
+        self.stft_enable = bool(stft_enable)
+        self.stft_weight = float(stft_weight)
+        self.stft_n_ffts = tuple(int(n) for n in stft_n_ffts)
+        self.stft_loss = MultiResSTFTLoss(n_ffts=self.stft_n_ffts) if self.stft_enable else None
+        self.lambda_coherence = float(lambda_coherence)
+        # Coherence can use STFT even when per-sample stft_enable is False
+        self._coherence_stft: Optional[MultiResSTFTLoss]
+        if self.lambda_coherence > 0 and self.stft_loss is None:
+            self._coherence_stft = MultiResSTFTLoss(n_ffts=self.stft_n_ffts)
+        else:
+            self._coherence_stft = None
 
-    def forward(self, x: torch.Tensor, x_freq: torch.Tensor, is_causal: bool = True) -> torch.Tensor:
-        return self.gpt(x, x_freq, is_causal=is_causal)
+        # MTP
+        self.num_pred_horizons = max(1, int(num_pred_horizons))
+        self.mtp_weight_decay  = float(mtp_weight_decay)
+
+        if self.freeze_trunk_epochs > 0:
+            frozen, trainable = 0, 0
+            for n, p in self.named_parameters():
+                if _is_sigma_param(n):
+                    trainable += p.numel()
+                    continue
+                p.requires_grad = False
+                frozen += p.numel()
+            self._trunk_frozen = True
+            print(
+                f"[stage2] froze trunk for first {self.freeze_trunk_epochs} epoch(s): "
+                f"frozen_params={frozen:,}, sigma_trainable={trainable:,}"
+            )
+
+    def _active_stft_loss(self) -> Optional[MultiResSTFTLoss]:
+        return self.stft_loss if self.stft_loss is not None else self._coherence_stft
+
+    def _cross_horizon_coherence_loss(
+        self,
+        predictions: list,
+        y_horizon: torch.Tensor,
+    ) -> torch.Tensor:
+        """Sum of MultiResSTFTLoss over concatenated consecutive horizon pairs."""
+        stft = self._active_stft_loss()
+        if stft is None:
+            return predictions[0].new_zeros(())
+        H = len(predictions)
+        total = predictions[0].new_zeros(())
+        for h in range(H - 1):
+            pred_h = self._prediction_mean(predictions[h])
+            pred_hp = self._prediction_mean(predictions[h + 1])
+            y_h = y_horizon[:, h, :, :]
+            y_hp = y_horizon[:, h + 1, :, :]
+            L = min(pred_h.shape[1], pred_hp.shape[1], y_h.shape[1], y_hp.shape[1])
+            if L <= 0:
+                continue
+            pred_cat = torch.cat([pred_h[:, :L], pred_hp[:, :L]], dim=1)
+            y_cat = torch.cat([y_h[:, :L], y_hp[:, :L]], dim=1)
+            total = total + stft(
+                pred_cat.transpose(1, 2).contiguous(),
+                y_cat.transpose(1, 2).contiguous(),
+            )
+        return total
+
+    def forward(self, x: torch.Tensor, is_causal: bool = True):
+        """Thin wrapper around GPT (time-only). Returns List[Tensor]."""
+        return self.gpt(x, is_causal=is_causal)
+
+    def _prediction_mean(self, out: torch.Tensor) -> torch.Tensor:
+        """Return mean prediction μ for deterministic and probabilistic (2×C) heads."""
+        if self.time_loss in _PROBABILISTIC_TIME_LOSSES:
+            return out[..., : self.hparams.in_channels]
+        return out
+
+    # =========================================================================
+    # Multi-step prediction loss
+    # =========================================================================
+    def _multistep_loss(
+        self,
+        predictions: list,        # List[Tensor[B, L, C]]  length H
+        y_horizon:   torch.Tensor, # [B, H, L, C]
+    ):
+        """
+        Weighted sum of energy-weighted losses across H horizons.
+
+        Weight for horizon h (1-indexed) = mtp_weight_decay^(h-1)
+          h=1 → 1.00  (full weight — inference head, no down-weighting)
+          h=2 → 0.50
+          h=3 → 0.25  …
+
+        Down-weighting distant horizons is important because:
+          1. Far-horizon targets are harder and noisier (stochastic coda).
+          2. We do not want auxiliary heads to dominate the h=1 gradient.
+
+        Returns:
+            total_loss    : weighted sum (scalar, differentiable)
+            horizon_losses: list of (h_idx, weight, loss_h.detach()) for logging
+        """
+        total_loss    = predictions[0].new_zeros(())
+        horizon_losses = []
+        loss_delta_0 = None
+        for idx, pred_h in enumerate(predictions):
+            h_idx  = idx + 1                              # 1-indexed
+            y_h    = y_horizon[:, idx, :, :]              # [B, L, C]
+            if y_h.shape[1] != pred_h.shape[1]:
+                continue  # length mismatch — skip (should not happen)
+
+            loss_time_h, loss_delta_h = self._time_domain_loss(pred_h, y_h)
+            if loss_delta_0 is None:
+                loss_delta_0 = loss_delta_h
+            loss_h = loss_time_h
+
+            # Optional STFT loss (computed on waveforms [B, C, L])
+            if self.stft_enable and self.stft_loss is not None and self.stft_weight > 0:
+                pred_mu_h = self._prediction_mean(pred_h)
+                loss_stft_h = self.stft_loss(
+                    pred_mu_h.transpose(1, 2).contiguous(),
+                    y_h.transpose(1, 2).contiguous(),
+                )
+                loss_h = loss_h + self.stft_weight * loss_stft_h
+            else:
+                loss_stft_h = None
+
+            weight = self.mtp_weight_decay ** (h_idx - 1) # 1.0, 0.5, 0.25, …
+            total_loss = total_loss + weight * loss_h
+            # Store detached total loss for logging (includes STFT if enabled)
+            horizon_losses.append((h_idx, weight, loss_h.detach()))
+        loss_delta_0 = loss_delta_0 if loss_delta_0 is not None else predictions[0].new_zeros(())
+        return total_loss, horizon_losses, loss_delta_0
+
+    # =========================================================================
+    # Time-domain loss
+    # =========================================================================
+    def _time_domain_loss(
+        self,
+        out: torch.Tensor,  # [B, L, C_out]  predictions
+        y:   torch.Tensor,  # [B, L, C]      targets   (L must be divisible by K)
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        Compute time-domain loss (MSE, L1, log-cosh, Gaussian/Laplace/Student-t NLL) with
+        uniform weighting over tokens. Optionally adds token-to-token temporal
+        consistency term on the mean prediction.
+        Returns (combined_loss, loss_delta) for logging.
+        """
+        K        = self.hparams.kernel_size
+        B, L, _  = out.shape
+        _, Ly, Cy = y.shape
+        if Ly != L:
+            raise ValueError(f"Prediction/target length mismatch: L_pred={L}, L_tgt={Ly}")
+        T        = L // K
+        if T * K != L:
+            raise ValueError(
+                f"Output length {L} must be divisible by kernel_size {K}"
+            )
+        y_tok   = y.view(B, T, K, Cy)
+
+        if self.time_loss in _PROBABILISTIC_TIME_LOSSES:
+            if out.shape[-1] != 2 * Cy:
+                raise ValueError(
+                    f"Probabilistic modes expect out channels = 2*C_target ({2 * Cy}), got {out.shape[-1]}"
+                )
+            mu, scale = out.split(Cy, dim=-1)
+            out_tok_mu = mu.view(B, T, K, Cy)
+            sig_tok = scale.view(B, T, K, Cy)
+            smin = math.exp(0.5 * self.nll_logvar_min)
+            smax = math.exp(0.5 * self.nll_logvar_max)
+            sig_tok = sig_tok.clamp(min=smin, max=smax)
+
+            if self.time_loss == "nll":
+                residual = out_tok_mu - y_tok
+                # Gaussian NLL: (y-mu)^2/(2*sigma^2) + log(sigma)
+                base = (
+                    0.5 * residual.pow(2) / (sig_tok.pow(2) + 1e-8)
+                    + torch.log(sig_tok)
+                ).mean()
+            elif self.time_loss == "nll_laplace":
+                # Laplace NLL: |y-mu|/b + log(b); ``sig_tok`` is scale b (same clamp as σ).
+                diff = y_tok - out_tok_mu
+                base = (torch.abs(diff) / sig_tok + torch.log(sig_tok)).mean()
+            elif self.time_loss == "nll_studentt":
+                nu = float(self.studentt_df)
+                z2 = ((y_tok - out_tok_mu) / sig_tok).pow(2)
+                # Student-t NLL up to additive constants that depend only on fixed ν (omit lgamma).
+                # If ν is ever learned, reintroduce those constant terms.
+                base = (
+                    0.5 * (nu + 1.0) * torch.log1p(z2 / nu) + torch.log(sig_tok)
+                ).mean()
+            else:
+                raise AssertionError(f"Unhandled probabilistic time_loss: {self.time_loss}")
+        else:
+            out_tok_mu = out.view(B, T, K, Cy)
+            residual = out_tok_mu - y_tok
+            if self.time_loss == "mse":
+                base = residual.pow(2).mean()
+            elif self.time_loss == "l1":
+                base = residual.abs().mean()
+            elif self.time_loss == "log_cosh":
+                base = self.log_cosh_loss(out_tok_mu, y_tok)
+            else:
+                raise ValueError(
+                    f"time_loss must be 'mse', 'l1', 'log_cosh', 'nll', "
+                    f"'nll_laplace', or 'nll_studentt', got '{self.time_loss}'"
+                )
+
+        # Optional temporal-delta: encourages temporal consistency across neighboring
+        # tokens to improve AR rollout stability. Only computed when weight > 0.
+        if self.temporal_delta_weight != 0.0:
+            d_out = out_tok_mu[:, 1:] - out_tok_mu[:, :-1]   # [B, T-1, K, C]
+            d_y   = y_tok[:, 1:] - y_tok[:, :-1]
+            loss_delta = F.mse_loss(d_out, d_y)
+            combined = base + self.temporal_delta_weight * loss_delta
+        else:
+            loss_delta = out.new_zeros(())
+            combined = base
+
+        return combined, loss_delta
 
     def _shared_step(self, batch: dict, prefix: str) -> torch.Tensor:
-        x = batch["x"]            # [B, T, C, K]
-        x_freq = batch["x_freq"]  # [B, T, ...]
-        y = batch["y"]            # [B, T*K, C]
+        """
+        Shared forward + loss for train and validation.
 
-        out = self(x, x_freq, is_causal=True)  # [B, T*K, C]
+        Optional batch key: y_horizon [B, H, T*K, C] for multi-horizon targets (MTP).
+        """
+        x      = batch["x"]       # [B, T, C, K]
+        y      = batch["y"]       # [B, T*K, C]  (horizon-1, always present)
 
-        # ---------------------------------------------------------
-        # Reshape to tokens
-        # ---------------------------------------------------------
-        B, L, C = out.shape
-        K = self.hparams.kernel_size
-        T = L // K
-        if T * K != L:
-            raise ValueError("Output length must be multiple of kernel_size")
+        y_horizon = batch.get("y_horizon", None)   # [B, H, T*K, C] or None
 
-        out_tok = out.view(B, T, K, C)
-        y_tok   = y.view(B, T, K, C)
+        # Forward (time-only)
+        predictions = self(x, is_causal=True)
 
-        # ---------------------------------------------------------
-        # Per-token energy (RMS)
-        # ---------------------------------------------------------
-        eps = 1e-6
-        energy = y_tok.pow(2).mean(dim=(2, 3)).sqrt()  # [B, T]
+        # predictions[0] is always the horizon-1 (inference) head
+        out = predictions[0]   # [B, T*K, C]
+        out_mu = self._prediction_mean(out)
 
-        # ---------------------------------------------------------
-        # Soft energy weighting
-        # ---------------------------------------------------------
-        alpha = 0.5   # <--- IMPORTANT HYPERPARAMETER
-        weights = (energy + eps) ** alpha              # [B, T]
-        weights = weights / (weights.mean() + eps)     # normalize for stability
-
-        # ---------------------------------------------------------
-        # Base per-sample loss (no normalization!)
-        # ---------------------------------------------------------
-        residual = out_tok - y_tok
-
-        if self.time_loss == "mse":
-            base_loss = residual.pow(2)
-        elif self.time_loss == "l1":
-            base_loss = residual.abs()
-        elif self.time_loss == "log_cosh":
-            base_loss = torch.log(torch.cosh(residual + 1e-12))
+        # ── Loss ─────────────────────────────────────────────────────────────
+        if y_horizon is not None and len(predictions) > 1:
+            loss_time, horizon_losses, loss_delta = self._multistep_loss(predictions, y_horizon)
         else:
-            raise ValueError("time_loss must be 'mse', 'l1', or 'log_cosh'")
+            loss_time, loss_delta = self._time_domain_loss(out, y)
+            horizon_losses = [(1, 1.0, loss_time.detach())]
 
-        # base_loss: [B, T, K, C] → reduce over samples
-        base_loss = base_loss.mean(dim=(2, 3))         # [B, T]
+        loss = loss_time
 
-        # ---------------------------------------------------------
-        # Energy-weighted loss
-        # ---------------------------------------------------------
-        loss = (weights * base_loss).mean()
+        # Optional STFT loss for the inference head (horizon-1) when MTP is off
+        # or when y_horizon is not provided. When MTP is active, STFT is already
+        # included inside _multistep_loss for every head.
+        if (y_horizon is None or len(predictions) <= 1) and self.stft_enable and self.stft_loss is not None and self.stft_weight > 0:
+            loss_stft = self.stft_loss(
+                out_mu.transpose(1, 2).contiguous(),
+                y.transpose(1, 2).contiguous(),
+            )
+            loss = loss + self.stft_weight * loss_stft
+        else:
+            loss_stft = None
 
-        # ---------------------------------------------------------
-        # Logging
-        # ---------------------------------------------------------
-        plain_mse = F.mse_loss(out, y)
+        loss_coherence = None
+        if (
+            self.training
+            and self.lambda_coherence > 0
+            and self.num_pred_horizons > 1
+            and y_horizon is not None
+            and len(predictions) > 1
+        ):
+            stft_c = self._active_stft_loss()
+            if stft_c is not None:
+                loss_coherence = self._cross_horizon_coherence_loss(predictions, y_horizon)
+                loss = loss + self.lambda_coherence * loss_coherence
 
+        # ── Logging (minimal: reduces TensorBoard/sync overhead) ─────────────
+        # Total `{prefix}_loss` keeps EarlyStopping / ModelCheckpoint on ``val_loss`` working.
+        self.log(f"{prefix}_loss_time", loss_time, sync_dist=True)
+        if loss_stft is not None:
+            self.log(f"{prefix}_stft", loss_stft, sync_dist=True)
+        if prefix == "val":
+            self.log(f"{prefix}_mse", F.mse_loss(out_mu, y), sync_dist=True)
+        # MTP: unweighted per-horizon loss (time + per-head STFT if any) for depth diagnostics
+        if len(horizon_losses) > 1:
+            for h_idx, _w, l_h in horizon_losses:
+                self.log(f"{prefix}_mtp_h{h_idx}_raw", l_h, sync_dist=True)
         self.log(f"{prefix}_loss", loss, prog_bar=True, sync_dist=True)
-        self.log(f"{prefix}_mse", plain_mse, sync_dist=True)
-        self.log(f"{prefix}_energy_mean", energy.mean(), sync_dist=True)
-        self.log(f"{prefix}_energy_min", energy.min(), sync_dist=True)
-        self.log(f"{prefix}_energy_max", energy.max(), sync_dist=True)
-
-        with torch.no_grad():
-            self.log(f"{prefix}_pred_std", out.std(), sync_dist=True)
-            self.log(f"{prefix}_target_std", y.std(), sync_dist=True)
 
         return loss
-
-
-    def _ss_prob(self) -> float:
-        """Linearly ramp scheduled sampling probability from start to end over warmup."""
-        if not self.ss_enable or self.ss_warmup_steps <= 0:
-            return 0.0
-        t = min(self.global_step / self.ss_warmup_steps, 1.0)
-        return self.ss_start_prob + t * (self.ss_end_prob - self.ss_start_prob)
-
-    def _compute_freq(self, x_tokens: torch.Tensor) -> torch.Tensor:
-        """Recompute freq features from time tokens (matches dataset pipeline)."""
-        return freq_features_from_tokens(
-            x_tokens,
-            freq_keep_bins=self.freq_keep_bins,
-            freq_log1p=self.freq_log1p,
-            freq_norm=self.freq_norm,
-        )
 
     def training_step(self, batch: dict, batch_idx: int) -> torch.Tensor:
-        # Default path: no scheduled sampling (preserves original behavior exactly)
-        if not self.ss_enable or self.ss_unroll_tokens <= 0:
-            return self._shared_step(batch, "train")
-
-        # =====================================================================
-        # Scheduled sampling: token-level closed-loop unroll (exposure bias reduction)
-        # Train with U steps of autoregressive rollout so the model sees its own
-        # predictions (and their FFT features) during training, closing the
-        # train/inference gap.
-        # =====================================================================
-        x = batch["x"]            # [B, T, C, K]
-        y = batch["y"]            # [B, T*K, C]
-        B, T, C, K = x.shape
-        U = min(self.ss_unroll_tokens, T - 1)  # clamp to sequence length
-        if U <= 0:
-            return self._shared_step(batch, "train")
-
-        p = self._ss_prob()
-        self.log("ss_prob", p, prog_bar=False)
-
-        # Pick start index biased toward later tokens (harder merger region)
-        bias_window = max(1, int(self.ss_bias_window_frac * T))
-        earliest = max(0, T - U - bias_window)
-        latest = T - U
-        start = torch.randint(earliest, latest + 1, (1,)).item()
-
-        # Build initial context from ground truth
-        x_ctx = x[:, :start, :, :].clone()  # [B, start, C, K]
-
-        # Collect predictions for loss
-        pred_tokens_list = []    # each [B, K, C]
-        gt_tokens_list = []      # each [B, K, C]
-
-        for t_offset in range(U):
-            t_idx = start + t_offset
-            # Recompute freq features from current context
-            x_freq_ctx = self._compute_freq(x_ctx)  # [B, ctx_len, C, F]
-
-            # Forward through model
-            out = self(x_ctx, x_freq_ctx, is_causal=True)  # [B, ctx_len*K, C]
-
-            # Extract last-token prediction (K samples)
-            pred_samples = out[:, -K:, :]  # [B, K, C]
-            pred_tokens_list.append(pred_samples)
-
-            # Ground truth for this token
-            gt_token = x[:, t_idx, :, :]              # [B, C, K]
-            gt_samples = gt_token.permute(0, 2, 1)    # [B, K, C]
-            gt_tokens_list.append(gt_samples)
-
-            # Scheduled sampling: with prob p use prediction, else ground truth
-            pred_as_token = pred_samples.detach().permute(0, 2, 1).unsqueeze(1)  # [B,1,C,K]
-            gt_as_token = x[:, t_idx:t_idx+1, :, :]    # [B,1,C,K]
-
-            with torch.no_grad():
-                use_pred = (torch.rand(1, device=x.device) < p).item()
-            next_token = pred_as_token if use_pred else gt_as_token
-
-            x_ctx = torch.cat([x_ctx, next_token], dim=1)  # [B, ctx_len+1, C, K]
-
-        # Stack predictions: [B, U*K, C]
-        pred_all = torch.cat(pred_tokens_list, dim=1)  # [B, U*K, C]
-        gt_all = torch.cat(gt_tokens_list, dim=1)      # [B, U*K, C]
-
-        # Compute loss on unrolled tokens
-        if self.ss_future_only_loss:
-            out_flat = pred_all
-            y_flat = gt_all
-        else:
-            # Fall back to full-sequence loss via _shared_step
-            return self._shared_step(batch, "train")
-
-        # Reshape to tokens for energy-weighted loss (same as _shared_step)
-        B2, L2, C2 = out_flat.shape
-        T2 = L2 // K
-        out_tok = out_flat.view(B2, T2, K, C2)
-        y_tok = y_flat.view(B2, T2, K, C2)
-
-        eps = 1e-6
-        energy = y_tok.pow(2).mean(dim=(2, 3)).sqrt()
-        alpha = 0.5
-        weights = (energy + eps) ** alpha
-        weights = weights / (weights.mean() + eps)
-
-        residual = out_tok - y_tok
-        if self.time_loss == "mse":
-            base_loss = residual.pow(2)
-        elif self.time_loss == "l1":
-            base_loss = residual.abs()
-        elif self.time_loss == "log_cosh":
-            base_loss = torch.log(torch.cosh(residual + 1e-12))
-        else:
-            raise ValueError(f"Unknown time_loss='{self.time_loss}'")
-
-        base_loss = base_loss.mean(dim=(2, 3))
-        loss = (weights * base_loss).mean()
-
-        # Logging
-        plain_mse = F.mse_loss(out_flat, y_flat)
-        self.log("train_loss", loss, prog_bar=True, sync_dist=True)
-        self.log("train_mse", plain_mse, sync_dist=True)
-        self.log("train_ss_unroll_start", float(start), sync_dist=True)
-
-        return loss
+        return self._shared_step(batch, "train")
 
     def validation_step(self, batch: dict, batch_idx: int) -> torch.Tensor:
         return self._shared_step(batch, "val")
 
+    def on_train_epoch_start(self) -> None:
+        if (
+            self.freeze_trunk_epochs > 0
+            and self._trunk_frozen
+            and self.current_epoch >= self.freeze_trunk_epochs
+        ):
+            count = 0
+            for n, p in self.named_parameters():
+                if _is_sigma_param(n):
+                    continue
+                p.requires_grad = True
+                count += p.numel()
+            self._trunk_frozen = False
+            print(
+                f"[stage2] Unfroze trunk at epoch {self.current_epoch}; "
+                f"trainable trunk params={count:,}."
+            )
+
     def configure_optimizers(self):
-        optimizer = torch.optim.AdamW(self.parameters(), lr=self.lr)
+        sigma_params = []
+        trunk_params = []
+        for n, p in self.named_parameters():
+            if _is_sigma_param(n):
+                sigma_params.append(p)
+            else:
+                trunk_params.append(p)
+
+        param_groups = []
+        if trunk_params:
+            param_groups.append(
+                {
+                    "params": trunk_params,
+                    "lr": self.lr * self.lr_trunk_multiplier,
+                    "name": "trunk",
+                }
+            )
+        if sigma_params:
+            param_groups.append(
+                {"params": sigma_params, "lr": self.lr_sigma_head, "name": "sigma"}
+            )
+        if not param_groups:
+            raise RuntimeError("No trainable parameters found for optimizer setup.")
+
+        optimizer = torch.optim.AdamW(param_groups, lr=self.lr)
         if not self.scheduler:
             return optimizer
 
@@ -371,10 +589,48 @@ class GPTLightning(LightningModule):
         else:
             kwargs = {}
 
-        scheduler = sched_class(optimizer, **kwargs)
+        main_scheduler = sched_class(optimizer, **kwargs)
+        warmup_steps = int(self.hparams.lr_warmup_steps)
+        use_warmup = warmup_steps > 0 and self.scheduler == "CosineAnnealingWarmRestarts"
+        if warmup_steps > 0 and not use_warmup:
+            import warnings
+
+            warnings.warn(
+                "lr_warmup_steps > 0 only chains with scheduler CosineAnnealingWarmRestarts; "
+                "warmup ignored for other schedulers.",
+                UserWarning,
+                stacklevel=2,
+            )
+
+        if use_warmup:
+            from torch.optim.lr_scheduler import LinearLR, SequentialLR
+
+            warmup_sched = LinearLR(
+                optimizer,
+                start_factor=1e-8,
+                end_factor=1.0,
+                total_iters=warmup_steps,
+            )
+            scheduler = SequentialLR(
+                optimizer,
+                schedulers=[warmup_sched, main_scheduler],
+                milestones=[warmup_steps],
+            )
+            interval = "step"
+        else:
+            scheduler = main_scheduler
+            interval = self.lr_scheduler_interval
+
+        if len(param_groups) == 2:
+            lrs_now = scheduler.get_last_lr() if hasattr(scheduler, "get_last_lr") else []
+            if len(lrs_now) != 2:
+                raise RuntimeError(
+                    f"Expected 2 scheduler LRs for trunk/sigma groups, got {len(lrs_now)}."
+                )
+
         lr_config = {
             "scheduler": scheduler,
-            "interval": self.lr_scheduler_interval,
+            "interval": interval,
             "frequency": self.lr_scheduler_frequency,
         }
         if self.lr_scheduler_monitor:
