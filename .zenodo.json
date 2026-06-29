@@ -1,0 +1,26 @@
+{
+    "title": "SeismoGPT: Data-Driven Forecasting of Three-Component Seismograms Using Transformer Architectures",
+    "description": "Implementation of the SeismoGPT framework for autoregressive seismic waveform forecasting, including data generation, training, and evaluation pipelines.",
+    "upload_type": "software",
+    "creators": [
+        {"name": "Esmail, Waleed", "orcid": "https://orcid.org/0000-0002-0097-3668", "affiliation": "Universität Münster"},
+        {"name": "Russell, Stuart", "affiliation": "Universität Münster / James Cook University"},
+        {"name": "Klinge, Jana", "affiliation": "Universität Münster"},
+        {"name": "Kappes, Alexander", "affiliation": "Universität Münster"},
+        {"name": "Thomas, Christine", "affiliation": "Universität Münster / GEUS"}
+    ],
+    "keywords": ["seismology", "transformer", "autoregressive forecasting", "deep learning", "waveform prediction"],
+    "license": "MIT",
+    "related_identifiers": [
+       {
+        "identifier": "10.48550/arXiv.2606.02912",
+        "relation": "isSupplementTo",
+        "scheme": "doi"
+       },
+       {
+        "identifier": "10.48550/arXiv.2606.10868",
+        "relation": "isSupplementTo",
+        "scheme": "doi"
+       }
+    ]    
+}
