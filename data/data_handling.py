@@ -142,6 +142,8 @@ class SeismicWaveformDataset(Dataset):
         num_pred_horizons: int = 1,
         aug_polarity_flip: bool = False,
         aug_channel_swap: bool = False,
+        norm_mode: str = "anchor",
+        anchor_len: int | None = None,
     ):
         if sbd is None:
             raise ImportError("seisbench is required for SeismicWaveformDataset. Install with: pip install seisbench")
@@ -157,6 +159,14 @@ class SeismicWaveformDataset(Dataset):
         self.num_pred_horizons = max(1, int(num_pred_horizons))
         self.aug_polarity_flip = bool(aug_polarity_flip)
         self.aug_channel_swap = bool(aug_channel_swap)
+        # v2 (JGR revision): "anchor" = causal normalisation (default);
+        # "legacy_peak" = the submitted, non-causal one (whole-window demean,
+        # detrend and per-channel peak), kept only to reproduce old numbers.
+        if norm_mode not in ("anchor", "legacy_peak"):
+            raise ValueError("norm_mode must be 'anchor' or 'legacy_peak'")
+        self.norm_mode = norm_mode
+        self.anchor_len = int(anchor_len) if anchor_len else self.kernel_size
+        self._warned_zero_anchor = False
         self.sb_dataset = sbd.WaveformDataset(self.data_dir)
         self.metadata = self.sb_dataset.metadata
 
@@ -202,6 +212,23 @@ class SeismicWaveformDataset(Dataset):
             raise ValueError("amp_norm must be one of: 'peak', 'std', 'rms', None")
         return strain
 
+    @staticmethod
+    def _normalize_anchor(segment: np.ndarray, anchor_len: int):
+        """v2: causal normalisation (Reviewer 2, comment 5).
+
+        Divide the whole window by the peak absolute value of its first
+        ``anchor_len`` samples (default: the first token), one scale shared by
+        all channels. The window starts at P, so the scale comes from the P
+        onset only: every model input depends on the past alone, and the
+        ratios between Z, N and E are kept. No mean, trend or epsilon: the
+        synthetics start at rest, and a fixed epsilon is comparable to the P
+        onset of small events (displacement in metres). Returns (scaled, scale).
+        """
+        peak = float(np.max(np.abs(segment[:, :anchor_len])))
+        if peak > 0.0:
+            return segment / peak, peak
+        return segment, 1.0          # no signal in the anchor: leave unscaled
+
     def __getitem__(self, idx: int):
         # Load full waveform [C, T_total]
         waveform = self.sb_dataset.get_waveforms(idx)
@@ -212,7 +239,10 @@ class SeismicWaveformDataset(Dataset):
         p_sec = meta.get("trace_p_arrival_s", np.nan)
         if np.isfinite(p_sec):
             if self.random_shift:
-                p_sec += random.randint(-10, 10)
+                # v2: with the anchor normaliser the window must not start before P,
+                # or the first token (the anchor) may contain no signal at all
+                lo = 0 if self.norm_mode == "anchor" else -10
+                p_sec += random.randint(lo, 10)
             p_sample = int(p_sec * self.sr)
         else:
             p_sample = 0
@@ -234,7 +264,12 @@ class SeismicWaveformDataset(Dataset):
             log.info(f"Segment padded from {actual_len} to {required_len} samples")
 
         # Normalize
-        if self.normalize:
+        if self.normalize and self.norm_mode == "anchor":
+            segment, scale = self._normalize_anchor(segment, self.anchor_len)
+            if scale == 1.0 and not self._warned_zero_anchor:
+                log.warning(f"item {idx}: first token has no signal; left unscaled")
+                self._warned_zero_anchor = True
+        elif self.normalize:                                   # legacy_peak (submitted)
             segment = self._normalize_strain_max_per_channel(
                 segment, demean=True, detrend=True, amp_norm="peak"
             )
@@ -309,6 +344,8 @@ class SeismicDataModule(LightningDataModule):
         num_pred_horizons: int = 1,  # must match model num_pred_horizons
         aug_polarity_flip: bool = False,
         aug_channel_swap: bool = False,
+        norm_mode: str = "anchor",
+        anchor_len: int | None = None,
     ):
         super().__init__()
         self.data_dir = data_dir
@@ -322,6 +359,8 @@ class SeismicDataModule(LightningDataModule):
         self.num_pred_horizons = max(1, int(num_pred_horizons))
         self.aug_polarity_flip = aug_polarity_flip
         self.aug_channel_swap = aug_channel_swap
+        self.norm_mode = norm_mode
+        self.anchor_len = anchor_len
         self.save_hyperparameters()
 
     def setup(self, stage=None):
@@ -336,6 +375,8 @@ class SeismicDataModule(LightningDataModule):
             num_pred_horizons=self.num_pred_horizons,
             aug_polarity_flip=self.aug_polarity_flip,
             aug_channel_swap=self.aug_channel_swap,
+            norm_mode=self.norm_mode,
+            anchor_len=self.anchor_len,
         )
         train_len = int(0.8 * len(self.full_dataset))
         val_len = int(0.1 * len(self.full_dataset))

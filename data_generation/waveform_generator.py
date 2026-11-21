@@ -55,11 +55,13 @@ def process_stream(stream, fmin, fmax, taper_s=10.0):
     return stream
 
 
-def stream_to_array(stream, component_order):
+def stream_to_array(stream, component_order, dtype="float32"):
     """v2: like seisbench.util.stream_to_array, but WITHOUT its last step,
     which subtracts the mean of the whole record (a statistic that includes
-    the future). Instaseis returns all components on the same time grid."""
-    return np.stack([stream.select(channel=f"??{c}")[0].data for c in component_order]).astype("float64")
+    the future). Instaseis returns all components on the same time grid.
+    v2: processing runs in float64; only the stored copy is cast to `dtype`
+    (float32 halves the disk use and is what training uses anyway)."""
+    return np.stack([stream.select(channel=f"??{c}")[0].data for c in component_order]).astype(dtype)
 
 
 class SeismicSyntheticDataGenerator:
@@ -84,6 +86,7 @@ class SeismicSyntheticDataGenerator:
         exclude_dist_deg=None,
         # v2: also write the unprocessed Instaseis traces to <output>_raw
         save_raw=False,
+        dtype="float32",
     ):
         """
         A coverage-aware synthetic generator that produces datasets
@@ -100,6 +103,7 @@ class SeismicSyntheticDataGenerator:
         self.freq_band = freq_band
         self.exclude_dist_deg = exclude_dist_deg
         self.save_raw = bool(save_raw)
+        self.dtype = dtype
 
         self.output_dir = output_dir
         self.output_postfix = str(output_postfix)
@@ -278,7 +282,7 @@ class SeismicSyntheticDataGenerator:
 
                     # Convert to array for SeisBench
                     # component_order is respected by stream_to_array
-                    data = stream_to_array(stream, components)  # v2: no whole-record demean
+                    data = stream_to_array(stream, components, self.dtype)  # v2: no whole-record demean
 
                     # Compute back-azimuth at the RECEIVER (direction receiver→source).
                     # If azimuth_deg is defined as source→receiver, back-azimuth = azimuth + 180 (mod 360).
@@ -334,7 +338,7 @@ class SeismicSyntheticDataGenerator:
                     }
                     writer.add_trace(trace_meta, data)
                     if raw_writer is not None:  # v2
-                        raw_data = stream_to_array(raw_stream, components)
+                        raw_data = stream_to_array(raw_stream, components, self.dtype)
                         raw_writer.add_trace(trace_meta, raw_data)
 
 
@@ -363,6 +367,8 @@ def main():
                         help="v2: leave out this distance band (deg), e.g. 50 60 for training")
     parser.add_argument("--save_raw", action="store_true",
                         help="v2: also write the unprocessed traces to <out>_<postfix>_raw")
+    parser.add_argument("--dtype", choices=["float32", "float64"], default="float32",
+                        help="v2: storage precision (processing is always float64)")
     args = parser.parse_args()
 
     gen = SeismicSyntheticDataGenerator(
@@ -378,6 +384,7 @@ def main():
         freq_band=(args.fmin, args.fmax),
         exclude_dist_deg=args.exclude_dist,
         save_raw=args.save_raw,
+        dtype=args.dtype,
     )
 
     gen.simulate_event(

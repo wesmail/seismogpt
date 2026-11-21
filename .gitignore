@@ -1,0 +1,14 @@
+# Python
+__pycache__/
+*.pyc
+
+# data and outputs (never in git)
+*.hdf5
+eda_plots/
+
+# SLURM logs
+*.out
+*.err
+
+# review material (peer review is confidential)
+REVISION.md

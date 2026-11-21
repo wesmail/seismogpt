@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Future-leakage test for the SeismoGPT preprocessing
-(JGR-MLC revision 2026JH001579).
+(JGR-MLC revision 2026JH001579, Reviewer 2, comment 5).
 
 The question: does the model input BEFORE the forecast start t0 depend on
 samples AFTER t0?  Test: change only the samples after t0, rerun the
@@ -21,12 +21,21 @@ Modes
   python leak_test.py --demo
       Stand-in record, no data needed.  Shows the size of each leak and that
       a causal chain gives exactly zero.
-  python leak_test.py --data_dir /path/PaperTestSet -n 1000
+  python leak_test.py --data_dir /path/PaperTestSet -n 1000 [--norm_mode legacy_peak]
       Stage 2 on the stored test traces (they already went through stage 1),
-      picking the same items as efficient_rollout.py (same seed).  Also
+      with the new anchor normaliser (default; must give exactly 0) or the
+      submitted one (legacy_peak), picking the same items as
+      efficient_rollout.py (same seed).  Also
       reports where the window peak sits, raw amplitudes vs the eps in the
       normaliser, and the sampled parameter ranges (for Table 1).
   python leak_test.py --data_dir /path/PaperTestSet --db /path/ak135f_2s -n 20
+      ...
+  python leak_test.py --raw_dir /path/SmallV2_1_raw
+      Unprocessed traces stored by the new generator (--save_raw). Measures the
+      leak of the SUBMITTED stage 1 (whole-record demean/detrend, 5 % taper,
+      zero-phase band-pass, SeisBench's mean subtraction) on real waveforms, the
+      whole submitted pipeline (stage 1 + 2), and, for contrast, the new
+      generator's processing (must be exactly 0).
       Regenerates the first n traces with Instaseis from the stored metadata,
       checks which settings reproduce the stored data (depth units,
       displacement vs velocity), then runs stages 1+2 end to end on raw data.
@@ -48,8 +57,10 @@ try:
     from data.data_handling import SeismicWaveformDataset
 
     _normalize = SeismicWaveformDataset._normalize_strain_max_per_channel
+    _anchor = getattr(SeismicWaveformDataset, "_normalize_anchor", None)
     NORM_SOURCE = "imported from data/data_handling.py"
 except Exception as exc:  # torch / lightning / seisbench missing
+    _anchor = None
 
     def _normalize(strain, demean=True, detrend=False, amp_norm="peak", eps=1e-8):
         # verbatim copy of SeismicWaveformDataset._normalize_strain_max_per_channel
@@ -76,8 +87,16 @@ WIN = (T_TOKENS + H) * K
 
 
 def dataset_stage(segment):
-    """Exactly what __getitem__ does to a window (normalize=True)."""
+    """The SUBMITTED __getitem__ normalisation (norm_mode="legacy_peak")."""
     return _normalize(segment, demean=True, detrend=True, amp_norm="peak") * 10.0
+
+
+def dataset_stage_anchor(segment):
+    """The v2 __getitem__ normalisation (norm_mode="anchor"), from the repo."""
+    if _anchor is None:
+        raise RuntimeError("data_handling.py has no _normalize_anchor: update it, or use "
+                           "--norm_mode legacy_peak")
+    return _anchor(segment, K)[0] * 10.0
 
 
 def dataset_stage_causal(segment, n_anchor=K):
@@ -90,7 +109,10 @@ def dataset_stage_causal(segment, n_anchor=K):
 # ----------------------------------------------------------------------------
 # Stage 1: the generator's processing chain, reproduced with ObsPy.
 # ----------------------------------------------------------------------------
-def generator_stage(data, fs, fmin=0.02, fmax=0.5):
+FMAX_DATA = 1.0 / 2.1      # band edge of the data: 1 / database period (2.1 s)
+
+
+def generator_stage(data, fs, fmin=0.02, fmax=FMAX_DATA):
     import obspy
 
     st = obspy.Stream([obspy.Trace(data=np.asarray(c, dtype=np.float64).copy(),
@@ -102,7 +124,7 @@ def generator_stage(data, fs, fmin=0.02, fmax=0.5):
     return np.stack([tr.data for tr in st])
 
 
-def generator_stage_causal(data, fs, fmin=0.02, fmax=0.5, n_pre=None):
+def generator_stage_causal(data, fs, fmin=0.02, fmax=FMAX_DATA, n_pre=None):
     """Leak-free reference: demean with the pre-P part only, taper only the
     start (a fixed window), one forward pass of the band-pass."""
     n_pre = n_pre or int(60 * fs)
@@ -245,18 +267,19 @@ def forecast_start(row, sr, ratio):
     return max(1, int(secs * sr) // K) * K
 
 
-def run_data(data_dir, n, seed, ratio):
+def run_data(data_dir, n, seed, ratio, norm_mode="anchor"):
     ds, meta, items = load_items(data_dir, n, seed)
     sr = float(meta["trace_sampling_rate_hz"].iloc[0])
+    stage = dataset_stage_anchor if norm_mode == "anchor" else dataset_stage
     print(f"{len(items)} items from {data_dir}, fs = {sr:.4f} Hz, "
-          f"context = {ratio} x (S-P), normaliser {NORM_SOURCE}\n")
+          f"context = {ratio} x (S-P), normaliser {NORM_SOURCE}, norm_mode = {norm_mode}\n")
 
     rels, peak_future, raw_peak, mws = [], [], [], []
     for i in items:
         row = meta.iloc[i]
         seg = window_from_trace(ds.get_waveforms(int(i)), row["trace_p_arrival_s"], sr)
         t0 = forecast_start(row, sr, ratio)
-        rels.append(leak(dataset_stage, seg, perturb_scale(seg, t0), t0, sr)[0])
+        rels.append(leak(stage, seg, perturb_scale(seg, t0), t0, sr)[0])
         x = seg - seg.mean(axis=1, keepdims=True)
         x = scipy_signal.detrend(x, axis=1)
         peak_future.append(np.argmax(np.abs(x), axis=1) >= t0)
@@ -265,13 +288,18 @@ def run_data(data_dir, n, seed, ratio):
     rels, peak_future = np.array(rels), np.array(peak_future)
     raw_peak, mws = np.array(raw_peak), np.array(mws)
 
-    print("stage 2 leak (future x3), relative change of the context")
+    print(f"stage 2 leak (future x3, norm_mode {norm_mode}), relative change of the context")
     print(f"  median {np.median(rels):.3g}   90th pct {np.percentile(rels, 90):.3g}   "
-          f"exactly zero in {np.mean(rels == 0):.1%} of items")
-    print("  window peak after t0 (scale set by the future):  "
+          f"max {np.max(rels):.3g}   exactly zero in {np.mean(rels == 0):.1%} of items")
+    if norm_mode == "anchor":
+        anchors = np.array([np.max(np.abs(window_from_trace(ds.get_waveforms(int(i)),
+                            meta.iloc[i]["trace_p_arrival_s"], sr)[:, :K])) for i in items])
+        print(f"  anchor (peak of the first token): min {anchors.min():.2e}   median {np.median(anchors):.2e}"
+              f"   zero in {np.mean(anchors == 0):.1%} of items")
+    print("  window peak after t0 (what set the scale in the legacy normaliser):  "
           + "  ".join(f"{c} {m:.1%}" for c, m in zip("ZNE", peak_future.mean(0))))
 
-    print("\nraw window peak vs eps = 1e-8 in the normaliser "
+    print("\nlegacy normaliser only: raw window peak vs eps = 1e-8 in the normaliser "
           "(eps > 1 % of the peak means the scaled trace no longer peaks at 1)")
     eps_share = EPS_NORM / (raw_peak + EPS_NORM)
     edges = np.arange(np.floor(np.nanmin(mws)), np.ceil(np.nanmax(mws)) + 0.5, 0.5)
@@ -367,6 +395,84 @@ def run_db(db_path, ds, meta, items, sr, n_db, ratio):
     print(f"  median {np.median(e2e):.3g}   max {np.max(e2e):.3g}   over {len(e2e)} items")
 
 
+def old_stage1(data, fs, fmin, fmax):
+    """Stage 1 exactly as submitted: generator processing, then the mean
+    subtraction at the end of seisbench.util.stream_to_array."""
+    x = generator_stage(data, fs, fmin, fmax)
+    return x - x.mean(axis=1, keepdims=True)
+
+
+def run_raw(raw_dir, ratio, gen_dir="data_generation"):
+    import seisbench.data as sbd
+
+    ds = sbd.WaveformDataset(Path(raw_dir))
+    meta = ds.metadata
+    fs = float(meta["trace_sampling_rate_hz"].iloc[0])
+    fmin, fmax = float(meta["band_min_Hz"].iloc[0]), float(meta["band_max_Hz"].iloc[0])
+    f0 = float(np.sqrt(fmin * fmax))
+    try:
+        sys.path.insert(0, str(Path(gen_dir).resolve()))
+        from waveform_generator import process_stream
+        import obspy
+
+        def new_stage1(x):
+            st = obspy.Stream([obspy.Trace(np.asarray(c, np.float64).copy(),
+                                           header={"sampling_rate": fs}) for c in x])
+            return np.stack([tr.data for tr in process_stream(st, fmin, fmax)])
+    except ImportError as exc:
+        new_stage1 = None
+        print(f"NOTE: new generator not tested: cannot import waveform_generator from "
+              f"'{gen_dir}' ({exc}). Install the missing package (e.g. pip install instaseis) "
+              f"or pass --gen_dir.\n")
+    print(f"{len(meta)} unprocessed traces from {raw_dir}, fs = {fs:.4f} Hz, band {fmin:.3g}-{fmax:.3g} Hz, "
+          f"context = {ratio} x (S-P)\n")
+
+    res = {k: [] for k in ["s1_x3", "s1_arr", "e2e_arr", "new", "new_e2e"]}
+    for i in range(len(meta)):
+        row = meta.iloc[i]
+        p_sec = row.get("trace_p_arrival_s", np.nan)
+        if not (np.isfinite(p_sec) and np.isfinite(row.get("trace_s_arrival_s", np.nan))):
+            continue
+        x = ds.get_waveforms(i).astype(np.float64)
+        t0w = forecast_start(row, fs, ratio)           # forecast start inside the window
+        t0 = int(p_sec * fs) + t0w                      # the same instant in the record
+        s1 = lambda y: old_stage1(y, fs, fmin, fmax)
+        res["s1_x3"].append(leak(s1, x, perturb_scale(x, t0), t0, fs))
+        xa = perturb_arrival(x, t0, fs, f0=f0)
+        res["s1_arr"].append(leak(s1, x, xa, t0, fs))
+        model_input = lambda y: dataset_stage(window_from_trace(s1(y), p_sec, fs))
+        a0, b0 = model_input(x)[:, :t0w], model_input(xa)[:, :t0w]
+        res["e2e_arr"].append(float(np.max(np.abs(b0 - a0)) / np.max(np.abs(a0))))
+        if new_stage1 is not None:
+            res["new"].append(leak(new_stage1, x, xa, t0, fs)[0])
+            if _anchor is not None:      # new generator + new normaliser, end to end
+                new_input = lambda y: dataset_stage_anchor(window_from_trace(new_stage1(y), p_sec, fs))
+                a1, b1 = new_input(x)[:, :t0w], new_input(perturb_scale(xa, t0))[:, :t0w]
+                res["new_e2e"].append(float(np.max(np.abs(b1 - a1))))
+
+    def summ(v):
+        v = np.asarray(v, dtype=float)
+        return f"median {np.median(v):.3g}   90th pct {np.percentile(v, 90):.3g}   max {np.max(v):.3g}"
+
+    for key, label in [("s1_x3", "future x3"), ("s1_arr", f"extra arrival ({f0:.3g} Hz) after t0")]:
+        rel = [r[0] for r in res[key]]
+        reach = [r[1] for r in res[key]]
+        print(f"submitted stage 1 (zero-phase filter etc.), {label}:")
+        print(f"  relative change of the context:  {summ(rel)}")
+        print(f"  reaches back (s, change > 0.1 %): {summ(reach)}")
+    print("submitted pipeline end to end (stage 1 + normaliser), extra arrival after t0:")
+    print(f"  relative change of the model input before t0: {summ(res['e2e_arr'])}")
+    if res["new"]:
+        print("new generator processing, extra arrival after t0:")
+        print(f"  largest relative change: {np.max(res['new'])}   "
+              f"exactly zero in {np.mean(np.asarray(res['new']) == 0):.0%} of traces")
+    if res["new_e2e"]:
+        print("NEW pipeline end to end (new generator + anchor normaliser), future x3 + extra arrival:")
+        print(f"  largest change of the model input before t0: {np.max(res['new_e2e'])}   "
+              f"exactly zero in {np.mean(np.asarray(res['new_e2e']) == 0):.0%} of traces")
+    print(f"\n{len(res['s1_x3'])} traces tested")
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -378,12 +484,19 @@ def main():
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--context_ratio", type=float, default=1.0)
     ap.add_argument("--fs", type=float, default=1.9, help="sampling rate for --demo")
+    ap.add_argument("--raw_dir", help="unprocessed traces from the new generator (--save_raw)")
+    ap.add_argument("--gen_dir", default="data_generation", help="folder of waveform_generator.py")
+    ap.add_argument("--norm_mode", default="anchor", choices=["anchor", "legacy_peak"],
+                    help="which dataset normaliser --data_dir tests (default: the new one)")
     a = ap.parse_args()
 
+    if a.raw_dir:
+        run_raw(a.raw_dir, a.context_ratio, a.gen_dir)
+        return
     if a.demo or not a.data_dir:
         run_demo(a.fs, a.context_ratio)
         return
-    ds, meta, items, sr = run_data(a.data_dir, a.n, a.seed, a.context_ratio)
+    ds, meta, items, sr = run_data(a.data_dir, a.n, a.seed, a.context_ratio, a.norm_mode)
     if a.db:
         run_db(a.db, ds, meta, items, sr, a.n_db, a.context_ratio)
 
