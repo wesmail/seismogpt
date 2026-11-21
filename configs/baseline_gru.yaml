@@ -1,0 +1,60 @@
+# GRU baseline (JGR revision). Same trainer and data as configs/train.yaml;
+# only the model differs.
+# Run: python main.py fit --config configs/baseline_gru.yaml
+
+seed_everything: 42
+trainer:
+  max_epochs: 50
+  accelerator: "gpu"
+  devices: "-1"
+  strategy: "auto"
+  precision: "bf16-mixed"
+  gradient_clip_val: 1.0
+  callbacks:
+    - class_path: lightning.pytorch.callbacks.ModelCheckpoint
+      init_args:
+        save_weights_only: false
+        mode: "min"
+        monitor: "val_loss"
+        every_n_train_steps: 0
+        every_n_epochs: 1
+        train_time_interval: null
+    - class_path: lightning.pytorch.callbacks.EarlyStopping
+      init_args:
+        monitor: "val_loss"
+        min_delta: 0.0
+        patience: 10
+        verbose: false
+  logger:
+    - class_path: lightning.pytorch.loggers.TensorBoardLogger
+      init_args:
+        save_dir: "."
+        name: "logs_gru"
+
+model:
+  class_path: baselines.gru.GRULightning
+  init_args:
+    in_channels: 3
+    kernel_size: 16
+    hidden: 512
+    num_layers: 3
+    dropout: 0.1
+    lr: 1.0e-3
+    weight_decay: 0.01
+    warmup_steps: 1000
+
+data:
+  class_path: data.data_handling.SeismicDataModule
+  init_args:
+    data_dir: /path/to/SobolSamplingV2/train      # same as configs/train.yaml
+    kernel_size: 16
+    stride: 16
+    batch_size: 32
+    num_workers: 16
+    num_tokens: 320
+    normalize: true
+    random_shift: true
+    num_pred_horizons: 4
+    aug_polarity_flip: true
+    aug_channel_swap: true
+    norm_mode: anchor

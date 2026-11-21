@@ -87,8 +87,10 @@ class TrunkDriftMonitor(Callback):
 import torch.nn as nn
 class LogCoshLoss(nn.Module):
     def forward(self, x, y):  # x, y: [B, T, F]
-        diff = x - y
-        return torch.mean(torch.log(torch.cosh(diff + 1e-12)))
+        # v2: log(cosh(d)) = |d| + log(1 + exp(-2|d|)) - log 2, which does not overflow.
+        # The plain formula gives inf for |d| > ~89; anchor-normalised windows reach 1e3-1e4.
+        d = (x - y).abs()
+        return torch.mean(d + F.softplus(-2.0 * d) - math.log(2.0))
     
 
 class GPTLightning(LightningModule):
