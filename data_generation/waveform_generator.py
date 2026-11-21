@@ -4,9 +4,14 @@
 # - Sobol sampling over (depth, distance, azimuth, Mw)
 # - Multiple receivers per source
 # - SeisBench writer with rich, interpolation-friendly metadata
+#
+# v2 (JGR revision, Nov 2026): causal preprocessing, depth in metres,
+# explicit displacement, reproducible moment tensors, unique event ids,
+# optional held-out distance band and optional unprocessed copy.
 # ------------------------------------------------------------
 
 import argparse
+import contextlib
 from math import ceil, log2
 from pathlib import Path
 
@@ -29,6 +34,34 @@ from cmt import CMT
 from scipy.stats import qmc
 
 
+def process_stream(stream, fmin, fmax, taper_s=10.0):
+    """Causal preprocessing (v2).
+
+    Every output sample depends only on input samples at the same time or
+    earlier, so the record can later be cut into context and future without
+    information leaking backwards (Reviewer 2, comment 5).
+
+    v1 did: demean, linear detrend, 5 % taper at both ends, band-pass with
+    zerophase=True.
+    - demean / linear detrend removed: both are statistics of the whole record,
+      future included; Instaseis synthetics start at rest, so they are not needed.
+    - taper: now 10 s at the start only. The v1 taper (5 % of the record at each
+      end, minutes long) depended on the record length and could reach the P
+      wave at short distances; a forward-only filter needs no taper at the end.
+    - band-pass: one forward pass (zerophase=False) instead of forward + backward.
+    """
+    stream.taper(max_percentage=None, max_length=taper_s, type="hann", side="left")
+    stream.filter("bandpass", freqmin=fmin, freqmax=fmax, corners=4, zerophase=False)
+    return stream
+
+
+def stream_to_array(stream, component_order):
+    """v2: like seisbench.util.stream_to_array, but WITHOUT its last step,
+    which subtracts the mean of the whole record (a statistic that includes
+    the future). Instaseis returns all components on the same time grid."""
+    return np.stack([stream.select(channel=f"??{c}")[0].data for c in component_order]).astype("float64")
+
+
 class SeismicSyntheticDataGenerator:
     def __init__(
         self,
@@ -47,6 +80,10 @@ class SeismicSyntheticDataGenerator:
         num_receivers_per_event: int = 4,
         # processing band (Hz)
         freq_band=(0.02, 1.0),
+        # v2: distance band (deg) left out of this dataset, e.g. (50, 60)
+        exclude_dist_deg=None,
+        # v2: also write the unprocessed Instaseis traces to <output>_raw
+        save_raw=False,
     ):
         """
         A coverage-aware synthetic generator that produces datasets
@@ -61,6 +98,8 @@ class SeismicSyntheticDataGenerator:
         self.mw_range = mw_range
         self.num_receivers_per_event = int(num_receivers_per_event)
         self.freq_band = freq_band
+        self.exclude_dist_deg = exclude_dist_deg
+        self.save_raw = bool(save_raw)
 
         self.output_dir = output_dir
         self.output_postfix = str(output_postfix)
@@ -107,6 +146,7 @@ class SeismicSyntheticDataGenerator:
         Data are written in SeisBench format (metadata.csv + waveforms.hdf5).
         """
         rng = np.random.default_rng(random_seed)
+        np.random.seed(random_seed)  # v2: cmt.py draws moment tensors with np.random
 
         # Output paths
         base = Path(self.output_dir if self.output_postfix == "" else f"{self.output_dir}_{self.output_postfix}")
@@ -119,132 +159,72 @@ class SeismicSyntheticDataGenerator:
         rmin, rmax = self.target_dist_deg
         mw_min, mw_max = self.mw_range
 
-        #sampler = qmc.Sobol(d=6, scramble=True, seed=random_seed)
-        #U = sampler.random(num_events)
-
-        #depths = dmin + (dmax - dmin) * U[:, 0]
-        #dist_deg = rmin + (rmax - rmin) * U[:, 1]
-        #az0_deg = 360.0 * U[:, 2]  # base azimuth for the event
-        #Mw_vals = mw_min + (mw_max - mw_min) * U[:, 3]
-        #src_lat = -90.0 + 180.0 * U[:, 4]
-        #src_lon = -180.0 + 360.0 * U[:, 5]
-
-        # -----------------------------------------------------------------------------------------------------
-        # More controlled Sobol sampling
-        # Distances: overall 0.2°–25°, split as
-        # 40% in 0.2–3° (local)
-        # 40% in 3–10° (regional)
-        # 20% in 10–25° (long regional / surface-wave rich)
-        # Depths (km):
-        # 70% in 0–30 km (shallow crust)
-        # 20% in 30–70 km (intermediate)
-        # 10% in 70–150 km (deep-ish)
-        # Azimuths: 360° uniform
-        # Magnitudes: Mw range
-        # Source latitudes: -90°–90° uniform
-        # Source longitudes: -180°–180° uniform
-        # -----------------------------------------------------------------------------------------------------
-        # --- Sobol engine ---
+        # v2: uniform Sobol sampling over the requested ranges. This is the sampling
+        # that produced the data of the submitted paper (in v1 it was commented out
+        # in favour of a banded scheme with hard-coded ranges).
         sampler = qmc.Sobol(d=6, scramble=True, seed=random_seed)
-
-        # Use 2^m samples to avoid the SciPy "power of 2" warning
-        m = int(ceil(log2(num_events)))
+        m = int(ceil(log2(num_events)))              # 2^m points avoids SciPy's warning
         U = sampler.random_base2(m=m)[:num_events, :]
 
-        u_depth = U[:, 0]
-        u_dist  = U[:, 1]
-        u_az    = U[:, 2]
-        u_Mw    = U[:, 3]
-        u_lat   = U[:, 4]
-        u_lon   = U[:, 5]
+        depths = dmin + (dmax - dmin) * U[:, 0]
+        dist_deg = rmin + (rmax - rmin) * U[:, 1]
+        az0_deg = 360.0 * U[:, 2]  # base azimuth for the event
+        Mw_vals = mw_min + (mw_max - mw_min) * U[:, 3]
+        src_lat = -90.0 + 180.0 * U[:, 4]
+        src_lon = -180.0 + 360.0 * U[:, 5]
 
-        # ------------------------------------------------------------
-        # 1) Distance [deg] with 3 bands: 0.2–3, 3–10, 10–25
-        #    - 40% local       (0.2–3)
-        #    - 40% regional    (3–10)
-        #    - 20% long-regional (10–25)
-        # ------------------------------------------------------------
-        dist_deg = np.empty(num_events, dtype=float)
-
-        # Band 1: u_dist in [0, 0.4) -> [0.2, 3]
-        mask1 = u_dist < 0.4
-        u1 = u_dist[mask1] / 0.4
-        dist_deg[mask1] = 0.2 + (3.0 - 0.2) * u1
-
-        # Band 2: u_dist in [0.4, 0.8) -> [3, 10]
-        mask2 = (u_dist >= 0.4) & (u_dist < 0.8)
-        u2 = (u_dist[mask2] - 0.4) / 0.4
-        dist_deg[mask2] = 3.0 + (10.0 - 3.0) * u2
-
-        # Band 3: u_dist in [0.8, 1.0] -> [10, 25]
-        mask3 = u_dist >= 0.8
-        u3 = (u_dist[mask3] - 0.8) / 0.2
-        dist_deg[mask3] = 10.0 + (25.0 - 10.0) * u3
-
-        # ------------------------------------------------------------
-        # 2) Depth [km] with 3 bands: 0–30, 30–70, 70–150
-        #    - 70% shallow (0–30)
-        #    - 20% mid     (30–70)
-        #    - 10% deep    (70–150)
-        # ------------------------------------------------------------
-        depths = np.empty(num_events, dtype=float)
-
-        # Shallow: u_depth in [0, 0.7) -> [0, 30]
-        mask1 = u_depth < 0.7
-        u1 = u_depth[mask1] / 0.7
-        depths[mask1] = 0.0 + (30.0 - 0.0) * u1
-
-        # Mid: u_depth in [0.7, 0.9) -> [30, 70]
-        mask2 = (u_depth >= 0.7) & (u_depth < 0.9)
-        u2 = (u_depth[mask2] - 0.7) / 0.2
-        depths[mask2] = 30.0 + (70.0 - 30.0) * u2
-
-        # Deep: u_depth in [0.9, 1.0] -> [70, 150]
-        mask3 = u_depth >= 0.9
-        u3 = (u_depth[mask3] - 0.9) / 0.1
-        depths[mask3] = 70.0 + (150.0 - 70.0) * u3
-
-        # ------------------------------------------------------------
-        # 3) Other parameters as before
-        # ------------------------------------------------------------
-        mw_min, mw_max = self.mw_range
-
-        az0_deg = 360.0 * u_az
-        Mw_vals = mw_min + (mw_max - mw_min) * u_Mw
-        src_lat = -90.0 + 180.0 * u_lat
-        src_lon = -180.0 + 360.0 * u_lon        
-        # -----------------------------------------------------------------------------------------------------
+        # v2: optional held-out distance band (Reviewer 1): drop events inside it
+        if self.exclude_dist_deg is not None:
+            lo, hi = self.exclude_dist_deg
+            keep = ~((dist_deg >= lo) & (dist_deg < hi))
+            depths, dist_deg, az0_deg = depths[keep], dist_deg[keep], az0_deg[keep]
+            Mw_vals, src_lat, src_lon = Mw_vals[keep], src_lat[keep], src_lon[keep]
+            num_events = int(keep.sum())
 
         # SeisBench writer
-        with sbd.WaveformDataWriter(metadata_path, waveforms_path) as writer:
-            writer.data_format = {
+        with contextlib.ExitStack() as stack:
+            writer = stack.enter_context(sbd.WaveformDataWriter(metadata_path, waveforms_path))
+            raw_writer = None
+            if self.save_raw:  # v2: unprocessed copy, same metadata
+                raw_base = Path(f"{base}_raw")
+                raw_base.mkdir(parents=True, exist_ok=True)
+                raw_writer = stack.enter_context(
+                    sbd.WaveformDataWriter(raw_base / "metadata.csv", raw_base / "waveforms.hdf5"))
+            data_format = {
                 "dimension_order": "CW",
                 "component_order": components,
-                "measurement": "velocity",
-                "unit": "counts",
+                "measurement": "displacement",  # v2: was "velocity" (Instaseis default is displacement)
+                "unit": "m",                    # v2: was "counts"
                 "instrument_response": "not restituted",
             }
+            writer.data_format = data_format
+            if raw_writer is not None:
+                raw_writer.data_format = data_format
 
             taup = TauPyModel(self.seimic_model)
             period = float(self.db.info.period)
             src_shift = float(self.db.info.src_shift)
 
             for i in tqdm(range(num_events), desc="Simulating events"):
-                event_id = f"{i:06d}"
+                event_id = f"{random_seed}_{i:06d}"  # v2: unique across shards (seed differs)
 
                 # Source (CMT with fixed Mw for coverage control)
                 cmt = CMT(Mw=float(Mw_vals[i]))
+                # v2: take the components from cmt.mt, which cmt.py rescales to the
+                # requested Mw; cmt.mrr etc. are the unscaled draws (off by ~0.1 Mw)
+                mrr, mtt, mpp = (float(cmt.mt[0, 0]), float(cmt.mt[1, 1]), float(cmt.mt[2, 2]))
+                mrt, mrp, mtp = (float(cmt.mt[0, 1]), float(cmt.mt[0, 2]), float(cmt.mt[1, 2]))
                 source = instaseis.Source(
                     origin_time=obspy.UTCDateTime(),
                     latitude=float(src_lat[i]),
                     longitude=float(src_lon[i]),
-                    depth_in_m=float(depths[i]),
-                    m_rr=cmt.mrr,
-                    m_tt=cmt.mtt,
-                    m_pp=cmt.mpp,
-                    m_rt=cmt.mrt,
-                    m_rp=cmt.mrp,
-                    m_tp=cmt.mtp,
+                    depth_in_m=float(depths[i]) * 1000.0,  # v2: was km passed as metres
+                    m_rr=mrr,
+                    m_tt=mtt,
+                    m_pp=mpp,
+                    m_rt=mrt,
+                    m_rp=mrp,
+                    m_tp=mtp,
                 )
 
                 # Evenly spaced receivers around azimuth base (optionally jitter distance slightly)
@@ -271,19 +251,12 @@ class SeismicSyntheticDataGenerator:
                     )
 
                     # Generate seismograms
-                    stream = self.db.get_seismograms(source=source, receiver=receiver, components=components)
+                    stream = self.db.get_seismograms(source=source, receiver=receiver,
+                                                     components=components, kind="displacement")
 
-                    # --- Pre-processing (standardized) ---
-                    stream.detrend("demean")
-                    stream.detrend("linear")
-                    stream.taper(max_percentage=0.05, type="hann")
-                    stream.filter(
-                        "bandpass",
-                        freqmin=self.freq_band[0],
-                        freqmax=min(self.freq_band[1], 1.0 / period),
-                        corners=4,
-                        zerophase=True,
-                    )
+                    # --- Pre-processing (v2: causal, see process_stream) ---
+                    raw_stream = stream.copy() if raw_writer is not None else None
+                    process_stream(stream, self.freq_band[0], min(self.freq_band[1], 1.0 / period))
 
                     # Travel times (guard lengths)
                     arrivals = taup.get_travel_times(
@@ -297,15 +270,15 @@ class SeismicSyntheticDataGenerator:
                     for arr in arrivals:
                         # TauP returns multiple phases; pick first P and first S seen
                         if np.isnan(p_time_s) and arr.name.upper().startswith("P"):
-                            p_time_s = float(arr.time + src_shift)
+                            p_time_s = float(arr.time)  # v2: no + src_shift; Instaseis already removes it
                         if np.isnan(s_time_s) and arr.name.upper().startswith("S"):
-                            s_time_s = float(arr.time + src_shift)
+                            s_time_s = float(arr.time)  # v2: no + src_shift
                         if not np.isnan(p_time_s) and not np.isnan(s_time_s):
                             break
 
                     # Convert to array for SeisBench
                     # component_order is respected by stream_to_array
-                    _, data, _ = sbu.stream_to_array(stream, component_order=components)
+                    data = stream_to_array(stream, components)  # v2: no whole-record demean
 
                     # Compute back-azimuth at the RECEIVER (direction receiver→source).
                     # If azimuth_deg is defined as source→receiver, back-azimuth = azimuth + 180 (mod 360).
@@ -317,8 +290,7 @@ class SeismicSyntheticDataGenerator:
 
                     # Metadata (interpolation-friendly)
                     # Use *seconds* suffix for times to avoid confusion with "samples".
-                    writer.add_trace(
-                        {
+                    trace_meta = {
                             # IDs
                             "source_id": "synthetic",
                             "event_id": event_id,
@@ -347,40 +319,50 @@ class SeismicSyntheticDataGenerator:
                             "back_azimuth_deg": back_azimuth_deg, # receiver -> source (added)
                             # Magnitude & MT
                             "Mw": float(cmt.Mw),
-                            "m_rr": float(cmt.mrr),
-                            "m_tt": float(cmt.mtt),
-                            "m_pp": float(cmt.mpp),
-                            "m_rt": float(cmt.mrt),
-                            "m_rp": float(cmt.mrp),
-                            "m_tp": float(cmt.mtp),
+                            "m_rr": mrr,
+                            "m_tt": mtt,
+                            "m_pp": mpp,
+                            "m_rt": mrt,
+                            "m_rp": mrp,
+                            "m_tp": mtp,
                             # Provenance / processing
                             "earth_model": self.seimic_model,
                             "band_min_Hz": float(self.freq_band[0]),
                             "band_max_Hz": float(min(self.freq_band[1], 1.0 / period)),
-                        },
-                        data,
-                    )
+                            "filter_causal": 1,              # v2
+                            "generator_seed": int(random_seed),  # v2
+                    }
+                    writer.add_trace(trace_meta, data)
+                    if raw_writer is not None:  # v2
+                        raw_data = stream_to_array(raw_stream, components)
+                        raw_writer.add_trace(trace_meta, raw_data)
 
 
 def main():
     parser = argparse.ArgumentParser(description="[Generator] Sobol-sampled seismic events for SeisBench.")
     parser.add_argument("--db", type=str, required=False,
                         default="/scratch/tmp/wesmail/ak135f_2s/", help="Instaseis DB path or syngine URI")
-    parser.add_argument("--seimic_model", type=str, default="prem", help="TauP model (prem/ak135/iasp91)")
+    parser.add_argument("--seimic_model", type=str, default="ak135",
+                        help="TauP model (v2 default ak135, to match the ak135f database; v1: prem)")
     parser.add_argument("--num_events", type=int, default=5000, help="Number of sources to simulate")
-    parser.add_argument("--receivers_per_event", type=int, default=2, help="Receivers per source")
+    parser.add_argument("--receivers_per_event", type=int, default=1, help="Receivers per source (paper: 1)")
     parser.add_argument("--out", type=str, default="seisbench_data", help="Output dir base name")
     parser.add_argument("--postfix", type=str, default="", help="Output dir postfix (e.g., 01)")
     parser.add_argument("--min_depth", type=float, default=5.0)
-    parser.add_argument("--max_depth", type=float, default=20.0)
+    parser.add_argument("--max_depth", type=float, default=100.0)  # v2: paper range
     parser.add_argument("--min_dist", type=float, default=10.0)
-    parser.add_argument("--max_dist", type=float, default=40.0)
+    parser.add_argument("--max_dist", type=float, default=90.0)   # v2: paper range
     parser.add_argument("--mw_min", type=float, default=3.0)
     parser.add_argument("--mw_max", type=float, default=7.0)
     parser.add_argument("--components", type=str, default="ZNE")
     parser.add_argument("--fmin", type=float, default=0.02)
     parser.add_argument("--fmax", type=float, default=1.0)
-    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--seed", type=int, default=42,
+                        help="use a different seed for every shard, and separate seeds for test sets")
+    parser.add_argument("--exclude_dist", type=float, nargs=2, default=None, metavar=("LO", "HI"),
+                        help="v2: leave out this distance band (deg), e.g. 50 60 for training")
+    parser.add_argument("--save_raw", action="store_true",
+                        help="v2: also write the unprocessed traces to <out>_<postfix>_raw")
     args = parser.parse_args()
 
     gen = SeismicSyntheticDataGenerator(
@@ -394,6 +376,8 @@ def main():
         mw_range=(args.mw_min, args.mw_max),
         num_receivers_per_event=args.receivers_per_event,
         freq_band=(args.fmin, args.fmax),
+        exclude_dist_deg=args.exclude_dist,
+        save_raw=args.save_raw,
     )
 
     gen.simulate_event(
