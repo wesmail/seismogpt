@@ -26,13 +26,16 @@
 # A finished file is skipped, so a requeued or resubmitted task does no double work.
 #
 # First ONE task, check it, then the rest:
-#   sbatch --array=1 generate_v2.sh
-#   sbatch --array=2-132 generate_v2.sh
+#   sbatch --array=1 slurm/generate_slurm.sh
+#   sbatch --array=2-132 slurm/generate_slurm.sh
 
 set -eo pipefail
 
 # ------------------------------------------------------------------ settings
-REPO=${REPO:-/scratch/tmp/wesmail/seismogpt-review}     # clone, branch paper-review
+REPO=${REPO:-${SLURM_SUBMIT_DIR:-$PWD}}                  # default: the folder you submit from
+if [[ ! -f $REPO/data_generation/waveform_generator.py ]]; then
+    echo "REPO=$REPO is not the repository root; submit from the root or set REPO"; exit 1
+fi
 DB=${DB:-/scratch/tmp/wesmail/ak135f_2s/}
 OUT=${OUT:-/scratch/tmp/wesmail/ErUM-WAVE/SingleStation/SobolSamplingV2}
 N_TRAIN_TASKS=${N_TRAIN_TASKS:-130}
@@ -78,7 +81,7 @@ COMMIT=$(git -C "$REPO" rev-parse --short HEAD 2>/dev/null || echo unknown)
 if [[ -n "$(git -C "$REPO" status --porcelain data_generation 2>/dev/null)" ]]; then
     echo "WARNING: uncommitted changes in $REPO/data_generation; provenance is unclear"
 fi
-echo "task $ID: $SPLIT file $CHUNK, seed $SEED, $EVENTS events, commit $COMMIT, host $(hostname)"
+echo "task $ID: $SPLIT file $CHUNK, seed $SEED, $EVENTS events, repo $REPO, commit $COMMIT, host $(hostname)"
 
 # ------------------------------------------------------------------ generate
 rm -rf "$WORK" "${WORK}_raw"                             # leftovers of an interrupted run
@@ -90,7 +93,7 @@ python waveform_generator.py --db "$DB" --num_events "$EVENTS" \
 # a failed check stops the task here (exit code 1): nothing is moved into place
 if [[ $CHECK == 1 ]]; then
     cd "$REPO"
-    python check_generator.py --data_dir "$WORK" --gen_dir data_generation \
+    python data_generation/check_generator.py --data_dir "$WORK" \
         --n "$CHECK_N" "${CHECK_EXTRA[@]}"
 fi
 

@@ -1,6 +1,6 @@
 # slurm
 
-## generate_slurm.sh: the v2 (JGR Review) dataset on the cluster
+## generate_slurm.sh: the v2 dataset on the cluster
 
 One SLURM array job makes the whole dataset. Each array task writes one SeisBench file.
 
@@ -44,7 +44,7 @@ Edit the settings at the top of the script, or set them on the command line
 
 | setting | default | meaning |
 |---|---|---|
-| `REPO` | `/scratch/tmp/wesmail/seismogpt-review` | clone of this repository (branch `paper-review`) |
+| `REPO` | the folder you submit from | repository root (branch `paper-review`); submit from the root |
 | `DB` | `/scratch/tmp/wesmail/ak135f_2s/` | Instaseis database |
 | `OUT` | `.../SobolSamplingV2` | output folder |
 | `N_TRAIN_TASKS` | 130 | tasks above this number make test files |
