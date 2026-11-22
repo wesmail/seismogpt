@@ -52,6 +52,13 @@ if [[ -z "${SKIP_ENV:-}" ]]; then
     micromamba activate seismo
 fi
 export OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1 PYTHONUNBUFFERED=1
+# Instaseis compiles its inner functions with numba and caches the result next to its
+# code in the shared environment. Many tasks writing that cache at once corrupt it
+# ("ReferenceError: underlying object has vanished"). Each task gets its own cache
+# on the node instead; compiling costs a few seconds per task.
+export NUMBA_CACHE_DIR=${TMPDIR:-/tmp}/numba_${SLURM_JOB_ID:-local}_${SLURM_ARRAY_TASK_ID:-0}
+mkdir -p "$NUMBA_CACHE_DIR"
+trap 'rm -rf "$NUMBA_CACHE_DIR"' EXIT
 set -u
 
 # ------------------------------------------------------------------ what this task does
