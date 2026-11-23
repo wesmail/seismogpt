@@ -31,12 +31,16 @@ fi
 cd "$REPO"
 
 # ---- environment ----
+# Same activation as the training script used for the paper: the micromamba on PATH,
+# with its default root (where the "pytorch" environment lives).
 if [[ -z "${SKIP_ENV:-}" ]]; then
-    export MAMBA_ROOT_PREFIX=/scratch/tmp/wesmail/micromamba_root
-    eval "$(/scratch/tmp/wesmail/micromamba/bin/micromamba shell hook -s bash -r $MAMBA_ROOT_PREFIX)"
-    micromamba activate pytorch
-    export LD_LIBRARY_PATH="$MAMBA_ROOT_PREFIX/envs/pytorch/lib:${LD_LIBRARY_PATH:-}"
+    eval "$(micromamba shell hook --shell bash)"
+    micromamba activate "${ENV_NAME:-pytorch}"
+    export LD_LIBRARY_PATH="$MAMBA_ROOT_PREFIX/envs/${ENV_NAME:-pytorch}/lib:${LD_LIBRARY_PATH:-}"
 fi
+# stop at once, with a clear message, if the environment is not the right one
+python -c "import torch, lightning" 2>/dev/null || {
+    echo "torch/lightning not found in $(command -v python): environment not activated"; exit 1; }
 
 # ---- plain, unbuffered log output (no terminal in a batch job) ----
 export PYTHONUNBUFFERED=1 TOKENIZERS_PARALLELISM=false
