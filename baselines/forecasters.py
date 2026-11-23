@@ -175,19 +175,25 @@ class GRUForecaster(Forecaster):
 
     def __init__(self, checkpoint: str, device: str = "cpu"):
         from baselines.gru import GRULightning
-        self.net = GRULightning.load_from_checkpoint(checkpoint, map_location=device).net.eval()
+        lm = GRULightning.load_from_checkpoint(checkpoint, map_location=device)
+        self.net = lm.net.eval()
+        self.amp_compress = bool(lm.hparams.get("amp_compress", False))  # same option as SeismoGPT
         self.device = device
 
     @torch.no_grad()
     def forecast(self, ctx, n):
+        from models.lightning_module import compress_amplitude, expand_amplitude
         x = ctx.float().unsqueeze(0).to(self.device)        # [1, T, C, K]
+        if self.amp_compress:
+            x = compress_amplitude(x)
         y, h = self.net(x)                                   # read the whole context once
         nxt = y[:, -1:]                                      # first future token
         preds = [nxt]
         for _ in range(n - 1):
             nxt, h = self.net(nxt, h)                        # one step, state carried on
             preds.append(nxt)
-        return torch.cat(preds, dim=1)[0].cpu()
+        out = torch.cat(preds, dim=1)[0].cpu()
+        return expand_amplitude(out) if self.amp_compress else out
 
 
 # ======================================================================================
@@ -340,8 +346,9 @@ class SeismoGPT(Forecaster):
     def __init__(self, checkpoint: str, device: str = "cpu"):
         from efficient_rollout import CachedGPT
         from models.lightning_module import GPTLightning
-        model = GPTLightning.load_from_checkpoint(checkpoint, map_location=device).gpt.to(device).eval()
-        self.cached = CachedGPT(model)
+        lm = GPTLightning.load_from_checkpoint(checkpoint, map_location=device)
+        self.amp_compress = bool(getattr(lm, "amp_compress", False))   # v2 option
+        self.cached = CachedGPT(lm.gpt.to(device).eval())
         self.device = device
 
     def forecast(self, ctx, n):
@@ -350,7 +357,8 @@ class SeismoGPT(Forecaster):
         # rollout_kvcache reads the future only in teacher mode; in free mode the
         # appended zeros only set the length
         x = torch.cat([ctx.float(), ctx.new_zeros(n, C, K).float()]).unsqueeze(0).to(self.device)
-        _, pred, _, _ = rollout_kvcache(self.cached, x, T, n, K, mode="free")   # [n*K, C]
+        _, pred, _, _ = rollout_kvcache(self.cached, x, T, n, K, mode="free",
+                                        amp_compress=self.amp_compress)        # [n*K, C]
         return torch.from_numpy(pred).reshape(n, K, C).permute(0, 2, 1).contiguous()
 
 

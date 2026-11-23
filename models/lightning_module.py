@@ -82,6 +82,24 @@ class TrunkDriftMonitor(Callback):
             self._warned = True
 
 # =============================================================================
+# Amplitude compression (v2, optional: amp_compress)
+# =============================================================================
+# Anchor-normalised windows span about four orders of magnitude (P onset ~10,
+# surface waves up to ~1e4). With amp_compress the model works on
+#     y = sign(x) * log(1 + |x|)            (x = sign(y) * (exp(|y|) - 1))
+# which maps 10 -> 2.4 and 1e4 -> 9.2, the range the loss weights were tuned for.
+# Each sample is transformed on its own, so the transform cannot leak future
+# information. Training compresses inputs and targets; inference compresses the
+# context and expands the forecast, so all metrics are on real waveforms.
+def compress_amplitude(x: torch.Tensor) -> torch.Tensor:
+    return torch.sign(x) * torch.log1p(x.abs())
+
+
+def expand_amplitude(y: torch.Tensor) -> torch.Tensor:
+    return torch.sign(y) * torch.expm1(y.abs())
+
+
+# =============================================================================
 # Log-Cosh Loss
 # =============================================================================
 import torch.nn as nn
@@ -178,6 +196,9 @@ class GPTLightning(LightningModule):
         # When False, load_state_dict from --ckpt_path is non-strict (needed for
         # deterministic pretrain → NLL finetune: new ``shared_sigma_head`` weights missing in ckpt).
         checkpoint_load_strict: bool = True,
+        # v2: model works on sign(x)*log(1+|x|) (see compress_amplitude). Default off,
+        # so checkpoints trained without it load and evaluate unchanged.
+        amp_compress: bool = False,
         **kwargs,
     ):
         super().__init__()
@@ -196,6 +217,7 @@ class GPTLightning(LightningModule):
         # Loading a deterministic (1×C) checkpoint into any probabilistic mode still needs
         # ``checkpoint_load_strict=False`` (missing sigma head keys).
         self.time_loss = time_loss
+        self.amp_compress = bool(amp_compress)
         self.temporal_delta_weight = float(temporal_delta_weight)
         self.nll_logvar_min = float(nll_logvar_min)
         self.nll_logvar_max = float(nll_logvar_max)
@@ -470,6 +492,12 @@ class GPTLightning(LightningModule):
         y      = batch["y"]       # [B, T*K, C]  (horizon-1, always present)
 
         y_horizon = batch.get("y_horizon", None)   # [B, H, T*K, C] or None
+
+        if self.amp_compress:     # inputs and all targets in compressed units
+            x = compress_amplitude(x)
+            y = compress_amplitude(y)
+            if y_horizon is not None:
+                y_horizon = compress_amplitude(y_horizon)
 
         # Forward (time-only)
         predictions = self(x, is_causal=True)

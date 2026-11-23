@@ -65,6 +65,8 @@ model:
     compile_mode: "reduce-overhead"
     num_pred_horizons: 4
     mtp_weight_decay: 0.6
+    # v2: work on sign(x)*log(1+|x|) of the anchor-normalised window (pilot decides)
+    amp_compress: false
 
 data:
   class_path: data.data_handling.SeismicDataModule

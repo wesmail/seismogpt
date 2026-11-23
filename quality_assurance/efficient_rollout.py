@@ -267,6 +267,7 @@ def rollout_kvcache(
     n_future_tokens: int,
     kernel_size: int,
     mode: str = "free",
+    amp_compress: bool = False,
 ) -> tuple:
     """
     Autoregressive rollout with KV-cache.
@@ -282,7 +283,14 @@ def rollout_kvcache(
     pred_future : ndarray [L_future, C]
     L_context   : int   (samples)
     L_future    : int   (samples)
+
+    amp_compress: the model works on sign(x)*log(1+|x|) (v2 option). The context
+    (and, in teacher mode, the true tokens) are compressed before entering the
+    model, the forecast is expanded at the end. Inputs and outputs of this
+    function stay in linear units either way.
     """
+    from models.lightning_module import compress_amplitude, expand_amplitude
+    enc = compress_amplitude if amp_compress else (lambda t: t)
     B, T_full, C, K = x_full.shape
     T_context = min(T_context, T_full - 1)
     n_future_tokens = min(n_future_tokens, T_full - T_context)
@@ -294,7 +302,7 @@ def rollout_kvcache(
     gt_future = x_full[:, T_context: T_context + n_future_tokens]
 
     # Prefill: one forward pass over the full context
-    prefill_out = cached_model.forward_prefill(x_ctx)       # [1, T_ctx*K, C]
+    prefill_out = cached_model.forward_prefill(enc(x_ctx))  # [1, T_ctx*K, C]
     C_out = prefill_out.shape[-1]
     # For probabilistic models C_out = 2*C; we only need the mu (first C channels)
     if C_out > C:
@@ -306,7 +314,7 @@ def rollout_kvcache(
     # Autoregressive decode
     for i in range(1, n_future_tokens):
         if mode == "teacher":
-            inp_token = gt_future[:, i - 1: i]
+            inp_token = enc(gt_future[:, i - 1: i])
         else:
             prev_pred = pred_list[-1].unsqueeze(0).to(x_full.device, x_full.dtype)
             inp_token = prev_pred.permute(0, 2, 1).unsqueeze(1)    # [1, 1, C, K]
@@ -316,7 +324,10 @@ def rollout_kvcache(
             out = out[:, :, :C]
         pred_list.append(out[:, -K:, :].squeeze(0).cpu())
 
-    pred_future = torch.cat(pred_list, dim=0).float().numpy()
+    pred_future = torch.cat(pred_list, dim=0).float()       # model units
+    if amp_compress:
+        pred_future = expand_amplitude(pred_future)
+    pred_future = pred_future.numpy()
     true_future = (
         gt_future.squeeze(0)
         .permute(0, 2, 1)
@@ -437,6 +448,8 @@ def main():
     # ---- Model ----
     lightning_model = GPTLightning.load_from_checkpoint(args.checkpoint)
     model = lightning_model.gpt.to(device)
+    amp_compress = bool(getattr(lightning_model, "amp_compress", False))
+    print(f"Amplitude compression: {'on' if amp_compress else 'off'}")
     if use_half:
         model = model.half()
     model.eval()
@@ -486,6 +499,7 @@ def main():
 
         y_true_future, y_pred_rollout, L_ctx, L_fut = rollout_kvcache(
             cached_model, x_full, T_context, n_future_tokens, K, args.mode,
+            amp_compress=amp_compress,
         )
 
         metrics = evaluate_prediction_horizon(

@@ -12,3 +12,5 @@ eda_plots/
 
 # review material (peer review is confidential)
 REVISION.md
+local/
+eda_v2/

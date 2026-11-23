@@ -1,0 +1,16 @@
+# Pilot run b (JGR revision): amplitude compression ON: the model works on sign(x)*log(1+|x|).
+# Settings on top of train.yaml; everything else is identical between pilot a and b:
+#   python main.py fit --config configs/train.yaml --config configs/pilot_b.yaml
+trainer:
+  max_epochs: 3
+  logger:
+    - class_path: lightning.pytorch.loggers.TensorBoardLogger
+      init_args:
+        save_dir: "."
+        name: "logs_pilot_b"
+model:
+  init_args:
+    amp_compress: true
+data:
+  init_args:
+    data_dir: /scratch/tmp/wesmail/ErUM-WAVE/SingleStation/SobolSamplingV2/pilot_train

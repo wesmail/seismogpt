@@ -42,6 +42,8 @@ model:
     lr: 1.0e-3
     weight_decay: 0.01
     warmup_steps: 1000
+    # v2: work on sign(x)*log(1+|x|) of the anchor-normalised window (pilot decides)
+    amp_compress: false
 
 data:
   class_path: data.data_handling.SeismicDataModule

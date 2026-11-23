@@ -46,7 +46,8 @@ class TokenGRU(nn.Module):
 class GRULightning(LightningModule):
     def __init__(self, in_channels: int = 3, kernel_size: int = 16, hidden: int = 512,
                  num_layers: int = 3, dropout: float = 0.1, lr: float = 1e-3,
-                 weight_decay: float = 0.01, warmup_steps: int = 1000):
+                 weight_decay: float = 0.01, warmup_steps: int = 1000,
+                 amp_compress: bool = False):
         super().__init__()
         self.save_hyperparameters()
         self.net = TokenGRU(in_channels, kernel_size, hidden, num_layers, dropout)
@@ -55,6 +56,9 @@ class GRULightning(LightningModule):
         x = batch["x"]                                            # [B, T, C, K]
         B, T, C, K = x.shape
         y = batch["y"].reshape(B, T, K, C).permute(0, 1, 3, 2)    # next tokens, as [B, T, C, K]
+        if self.hparams.amp_compress:                             # same option as SeismoGPT
+            from models.lightning_module import compress_amplitude
+            x, y = compress_amplitude(x), compress_amplitude(y)
         pred, _ = self.net(x)
         loss = log_cosh(pred.float() - y.float()).mean()
         self.log(f"{prefix}_loss", loss, prog_bar=True, sync_dist=True)
