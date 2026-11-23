@@ -46,6 +46,8 @@ python -c "import torch, lightning" 2>/dev/null || {
 export PYTHONUNBUFFERED=1 TOKENIZERS_PARALLELISM=false
 export COLUMNS=120 TQDM_DYNAMIC_NCOLS=0 TERM=dumb NO_COLOR=1
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+# W&B: key kept outside the repository (one line in ~/.wandb_key, chmod 600)
+[[ -f ~/.wandb_key ]] && export WANDB_API_KEY=$(< ~/.wandb_key)
 
 # ---- arguments: *.yaml -> --config, the rest unchanged ----
 ARGS=()

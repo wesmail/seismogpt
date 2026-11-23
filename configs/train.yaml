@@ -12,6 +12,7 @@ trainer:
     - class_path: lightning.pytorch.callbacks.ModelCheckpoint
       init_args:
         save_weights_only: false
+        save_last: true
         mode: "min"
         monitor: "val_loss"
         every_n_train_steps: 0
@@ -28,6 +29,12 @@ trainer:
       init_args:
         save_dir: "."
         name: "logs"
+    - class_path: lightning.pytorch.loggers.WandbLogger
+      init_args:
+        project: seismogpt-review
+        name: seismogpt_v2
+        save_dir: "."
+        log_model: false
 
 model:
   class_path: models.lightning_module.GPTLightning
@@ -66,12 +73,12 @@ model:
     num_pred_horizons: 4
     mtp_weight_decay: 0.6
     # v2: work on sign(x)*log(1+|x|) of the anchor-normalised window (pilot decides)
-    amp_compress: false
+    amp_compress: true
 
 data:
   class_path: data.data_handling.SeismicDataModule
   init_args:
-    data_dir: /mnt/d/waleed/Seismology/simulation/clean/SobolDataset
+    data_dir: /scratch/tmp/wesmail/ErUM-WAVE/SingleStation/SobolSamplingV2/train
     kernel_size: 16
     stride: 16
     batch_size: 32
