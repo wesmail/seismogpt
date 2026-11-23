@@ -18,19 +18,19 @@ Two stages are tested, exactly as they are in the repository:
            per-channel demean, linear detrend, divide by per-channel peak, x10
 
 Modes
-  python leak_test.py --demo
+  python diagnostics/leak_test.py --demo
       Stand-in record, no data needed.  Shows the size of each leak and that
       a causal chain gives exactly zero.
-  python leak_test.py --data_dir /path/PaperTestSet -n 1000 [--norm_mode legacy_peak]
+  python diagnostics/leak_test.py --data_dir /path/PaperTestSet -n 1000 [--norm_mode legacy_peak]
       Stage 2 on the stored test traces (they already went through stage 1),
       with the new anchor normaliser (default; must give exactly 0) or the
       submitted one (legacy_peak), picking the same items as
       efficient_rollout.py (same seed).  Also
       reports where the window peak sits, raw amplitudes vs the eps in the
       normaliser, and the sampled parameter ranges (for Table 1).
-  python leak_test.py --data_dir /path/PaperTestSet --db /path/ak135f_2s -n 20
+  python diagnostics/leak_test.py --data_dir /path/PaperTestSet --db /path/ak135f_2s -n 20
       ...
-  python leak_test.py --raw_dir /path/SmallV2_1_raw
+  python diagnostics/leak_test.py --raw_dir /path/SmallV2_1_raw
       Unprocessed traces stored by the new generator (--save_raw). Measures the
       leak of the SUBMITTED stage 1 (whole-record demean/detrend, 5 % taper,
       zero-phase band-pass, SeisBench's mean subtraction) on real waveforms, the
@@ -48,7 +48,8 @@ from pathlib import Path
 import numpy as np
 import scipy.signal as scipy_signal
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
+ROOT = Path(__file__).resolve().parent.parent      # repository root (this file is in diagnostics/)
+sys.path.insert(0, str(ROOT))
 
 # ----------------------------------------------------------------------------
 # Stage 2: the dataset normaliser. Imported from the repo when possible.
@@ -402,7 +403,7 @@ def old_stage1(data, fs, fmin, fmax):
     return x - x.mean(axis=1, keepdims=True)
 
 
-def run_raw(raw_dir, ratio, gen_dir="data_generation"):
+def run_raw(raw_dir, ratio, gen_dir=str(ROOT / "data_generation")):
     import seisbench.data as sbd
 
     ds = sbd.WaveformDataset(Path(raw_dir))
@@ -485,7 +486,7 @@ def main():
     ap.add_argument("--context_ratio", type=float, default=1.0)
     ap.add_argument("--fs", type=float, default=1.9, help="sampling rate for --demo")
     ap.add_argument("--raw_dir", help="unprocessed traces from the new generator (--save_raw)")
-    ap.add_argument("--gen_dir", default="data_generation", help="folder of waveform_generator.py")
+    ap.add_argument("--gen_dir", default=str(ROOT / "data_generation"), help="folder of waveform_generator.py")
     ap.add_argument("--norm_mode", default="anchor", choices=["anchor", "legacy_peak"],
                     help="which dataset normaliser --data_dir tests (default: the new one)")
     a = ap.parse_args()

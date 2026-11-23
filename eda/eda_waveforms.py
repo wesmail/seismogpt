@@ -11,7 +11,7 @@ plus one summary figure for the whole folder:
   (a) window peak / anchor peak against distance
   (b) anchor peak (metres) against magnitude, with eps = 1e-8 for reference
 
-  python eda_waveforms.py --data_dir SmallV2_1 --n 6 --out eda_plots
+  python eda/eda_waveforms.py --data_dir SmallV2_1 --n 6 --out eda_plots
 """
 import argparse
 from pathlib import Path
