@@ -2,8 +2,8 @@
 #SBATCH --job-name=seismogpt_train
 #SBATCH --partition=gpu4090
 #SBATCH --nodes=1
-#SBATCH --ntasks=1
-#SBATCH --cpus-per-task=16              # 2 GPUs x 8 data-loading workers
+#SBATCH --ntasks-per-node=2             # ONE PROCESS PER GPU: must equal the number of GPUs
+#SBATCH --cpus-per-task=8               # per process: 8 data-loading workers
 #SBATCH --gres=gpu:2                    # 2 GPUs x batch 32 = effective batch 64, as in the paper
 #SBATCH --mem=64G
 #SBATCH --time=12:00:00                 # pilot: hours; full training: raise (partition allows 7 days)
@@ -14,6 +14,10 @@
 # Train SeismoGPT or a baseline. Submit from the repository root. Every argument ending
 # in .yaml becomes a --config (later files override earlier ones); anything else is
 # passed to main.py unchanged.
+#
+# Lightning starts one training process per SLURM task. --ntasks-per-node must therefore
+# equal the number of GPUs; with 1 task, only the first GPU is used. For one GPU:
+#   sbatch --gres=gpu:1 --ntasks-per-node=1 slurm/train_slurm.sh ...
 #
 #   sbatch slurm/train_slurm.sh configs/train.yaml configs/pilot_a.yaml
 #   sbatch slurm/train_slurm.sh configs/train.yaml configs/pilot_b.yaml
@@ -46,8 +50,6 @@ python -c "import torch, lightning" 2>/dev/null || {
 export PYTHONUNBUFFERED=1 TOKENIZERS_PARALLELISM=false
 export COLUMNS=120 TQDM_DYNAMIC_NCOLS=0 TERM=dumb NO_COLOR=1
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
-# W&B: key kept outside the repository (one line in ~/.wandb_key, chmod 600)
-[[ -f ~/.wandb_key ]] && export WANDB_API_KEY=$(< ~/.wandb_key)
 
 # ---- arguments: *.yaml -> --config, the rest unchanged ----
 ARGS=()
@@ -56,6 +58,11 @@ for a in "$@"; do
 done
 if [[ ${#ARGS[@]} -eq 0 ]]; then echo "give at least one config file"; exit 1; fi
 
+# stop if the number of processes does not match the number of GPUs
+N_GPU=$(nvidia-smi -L 2>/dev/null | wc -l)
+if [[ -n "${SLURM_NTASKS_PER_NODE:-}" && $N_GPU -gt 0 && $SLURM_NTASKS_PER_NODE -ne $N_GPU ]]; then
+    echo "--ntasks-per-node=$SLURM_NTASKS_PER_NODE but $N_GPU GPUs: set them equal"; exit 1
+fi
 echo "repo $REPO, commit $(git rev-parse --short HEAD 2>/dev/null || echo unknown), host $(hostname)"
 echo "python main.py fit ${ARGS[*]}"
 nvidia-smi --query-gpu=name,memory.total --format=csv,noheader 2>/dev/null || true
