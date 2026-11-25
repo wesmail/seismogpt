@@ -50,6 +50,16 @@ python -c "import torch, lightning" 2>/dev/null || {
 export PYTHONUNBUFFERED=1 TOKENIZERS_PARALLELISM=false
 export COLUMNS=120 TQDM_DYNAMIC_NCOLS=0 TERM=dumb NO_COLOR=1
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+# W&B: key kept outside the repository (one line in ~/.wandb_key, chmod 600)
+[[ -f ~/.wandb_key ]] && export WANDB_API_KEY=$(< ~/.wandb_key)
+# Never let W&B stop a training that waited in the queue: without a key, log offline
+# (upload later with: wandb sync wandb/offline-run-*)
+if [[ -n "${WANDB_API_KEY:-}" ]]; then
+    echo "W&B: key found, logging online"
+else
+    export WANDB_MODE=offline
+    echo "W&B: no key found (~/.wandb_key), logging OFFLINE; sync later with: wandb sync wandb/offline-run-*"
+fi
 
 # ---- arguments: *.yaml -> --config, the rest unchanged ----
 ARGS=()
