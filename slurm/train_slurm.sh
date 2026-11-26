@@ -1,12 +1,12 @@
 #!/bin/bash
 #SBATCH --job-name=seismogpt_train
-#SBATCH --partition=gpu4090
+#SBATCH --partition=gpu4090,gpu3090,gpua100   # whichever has a free GPU first
 #SBATCH --nodes=1
-#SBATCH --ntasks-per-node=2             # ONE PROCESS PER GPU: must equal the number of GPUs
-#SBATCH --cpus-per-task=8               # per process: 8 data-loading workers
-#SBATCH --gres=gpu:2                    # 2 GPUs x batch 32 = effective batch 64, as in the paper
-#SBATCH --mem=64G
-#SBATCH --time=12:00:00                 # pilot: hours; full training: raise (partition allows 7 days)
+#SBATCH --ntasks-per-node=1             # ONE PROCESS PER GPU: must equal the number of GPUs
+#SBATCH --cpus-per-task=9               # 8 data-loading workers + the training process
+#SBATCH --gres=gpu:1                    # 1 GPU, batch 32 (about 1 h per epoch on an RTX 4090)
+#SBATCH --mem=48G                       # measured need: see the "[mem ...]" lines in the log
+#SBATCH --time=7-00:00:00
 #SBATCH --output=%x_%j.log
 #SBATCH --error=%x_%j.err
 #SBATCH --open-mode=append
@@ -15,15 +15,17 @@
 # in .yaml becomes a --config (later files override earlier ones); anything else is
 # passed to main.py unchanged.
 #
-# Lightning starts one training process per SLURM task. --ntasks-per-node must therefore
-# equal the number of GPUs; with 1 task, only the first GPU is used. For one GPU:
-#   sbatch --gres=gpu:1 --ntasks-per-node=1 slurm/train_slurm.sh ...
-#
-#   sbatch slurm/train_slurm.sh configs/train.yaml configs/pilot_a.yaml
-#   sbatch slurm/train_slurm.sh configs/train.yaml configs/pilot_b.yaml
-#   sbatch --time=7-00:00:00 slurm/train_slurm.sh configs/train.yaml       # full training
+#   SMOKE=1 sbatch --time=00:20:00 slurm/train_slurm.sh configs/train.yaml   # 3-minute test FIRST
+#   sbatch slurm/train_slurm.sh configs/train.yaml                           # full training
+#   sbatch slurm/train_slurm.sh configs/train.yaml --ckpt_path logs/version_N/checkpoints/latest-....ckpt
 #   sbatch --job-name=gru slurm/train_slurm.sh configs/baseline_gru.yaml
-#   ... configs/train.yaml --ckpt_path logs/version_0/checkpoints/last.ckpt  # resume
+#
+# SMOKE=1 runs two tiny epochs (train -> validation -> train -> validation) without
+# logging, so that everything that can go wrong at an epoch boundary shows up in minutes,
+# and prints the memory it needed.
+#
+# Lightning starts one training process per SLURM task: --ntasks-per-node must equal the
+# number of GPUs. For two GPUs: --gres=gpu:2 --ntasks-per-node=2 (memory and CPUs double).
 
 set -eo pipefail
 
@@ -69,7 +71,7 @@ done
 if [[ ${#ARGS[@]} -eq 0 ]]; then echo "give at least one config file"; exit 1; fi
 
 # stop if the number of processes does not match the number of GPUs
-N_GPU=$(nvidia-smi -L 2>/dev/null | wc -l)
+N_GPU=$( (nvidia-smi -L 2>/dev/null || true) | wc -l)
 if [[ -n "${SLURM_NTASKS_PER_NODE:-}" && $N_GPU -gt 0 && $SLURM_NTASKS_PER_NODE -ne $N_GPU ]]; then
     echo "--ntasks-per-node=$SLURM_NTASKS_PER_NODE but $N_GPU GPUs: set them equal"; exit 1
 fi
@@ -77,5 +79,55 @@ echo "repo $REPO, commit $(git rev-parse --short HEAD 2>/dev/null || echo unknow
 echo "python main.py fit ${ARGS[*]}"
 nvidia-smi --query-gpu=name,memory.total --format=csv,noheader 2>/dev/null || true
 
+# ---- smoke test: two tiny epochs, nothing logged or kept ----
+if [[ -n "${SMOKE:-}" ]]; then
+    SMOKE_DIR=$(mktemp -d "${TMPDIR:-/tmp}/smoke_XXXXXX")
+    export WANDB_MODE=disabled
+    ARGS+=(--trainer.max_epochs 2 --trainer.limit_train_batches "${SMOKE_TRAIN:-400}"
+           --trainer.limit_val_batches "${SMOKE_VAL:-100}"
+           --trainer.logger false --trainer.default_root_dir "$SMOKE_DIR")
+    echo "SMOKE TEST: 2 epochs x (${SMOKE_TRAIN:-400} training + ${SMOKE_VAL:-100} validation batches), output in $SMOKE_DIR"
+fi
+
+# ---- memory used by this job (program memory, without the file cache), logged regularly ----
+mem_gb() {
+    local rel f
+    rel=$(awk -F: '$1=="0"{print $3}' /proc/self/cgroup 2>/dev/null)                 # cgroup v2
+    f=/sys/fs/cgroup${rel%/step_*}/memory.stat
+    if [[ -z $rel || ! -r $f ]]; then                                                 # cgroup v1
+        rel=$(awk -F: '$2 ~ /(^|,)memory(,|$)/{print $3}' /proc/self/cgroup 2>/dev/null)
+        f=/sys/fs/cgroup/memory${rel%/step_*}/memory.stat
+    fi
+    if [[ -r $f ]]; then
+        awk '$1=="anon"||$1=="rss"||$1=="shmem"{s+=$2} END{printf "%.1f", s/2^30}' "$f"
+    else                                                                              # fallback
+        ps -u "$USER" -o rss= | awk '{s+=$1} END{printf "%.1f", s/2^20}'
+    fi
+}
+PEAK_FILE=$(mktemp)
+echo 0 > "$PEAK_FILE"
+(
+    set +e
+    every=${MEM_EVERY:-$([[ -n "${SMOKE:-}" ]] && echo 15 || echo 600)}
+    first=1
+    while sleep "$([[ $first == 1 && $every -gt 120 ]] && echo 120 || echo "$every")"; do
+        first=0
+        m=$(mem_gb)
+        awk -v m="$m" -v p="$(cat "$PEAK_FILE")" 'BEGIN{exit !(m>p)}' && echo "$m" > "$PEAK_FILE"
+        echo "[mem $(date +%H:%M:%S)] ${m} GB used (limit ${SLURM_MEM_PER_NODE:-?} MB)"
+    done
+) &
+MON=$!
+cleanup() {                              # runs when the script ends, however it ends
+    local rc=$?
+    set +e
+    pkill -P "$MON" 2>/dev/null; kill "$MON" 2>/dev/null; wait "$MON" 2>/dev/null
+    echo "[mem] peak $(cat "$PEAK_FILE") GB"
+    rm -rf "$PEAK_FILE" ${SMOKE_DIR:-}
+    exit $rc
+}
+trap cleanup EXIT
+
 # srun so that Lightning's multi-GPU start-up works on this cluster
 ${LAUNCH-srun --unbuffered} python main.py fit "${ARGS[@]}"
+if [[ -n "${SMOKE:-}" ]]; then echo "SMOKE TEST PASSED"; fi

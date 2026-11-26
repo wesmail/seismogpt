@@ -14,3 +14,12 @@ eda_plots/
 REVISION.md
 local/
 eda_v2/
+
+# pilot run
+results/
+
+# checkpoints and logs
+checkpoints/
+logs/
+wandb/
+*.log

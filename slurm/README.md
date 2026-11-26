@@ -74,3 +74,64 @@ sbatch --dependency=afterok:$JOB --array=2-132 slurm/generate_slurm.sh
 When all tasks are done, `train/` should hold 130 files, `test/` 2, and
 `provenance.tsv` 132 lines. Resubmit any missing task number. Logs
 (`seismogpt_v2_data_<job>_<task>.out/.err`) are written to the folder you submit from.
+
+## train_slurm.sh: training on the cluster
+
+One script for SeismoGPT and the GRU baseline. Submit from the repository root.
+
+```bash
+SMOKE=1 sbatch --time=00:20:00 slurm/train_slurm.sh configs/train.yaml   # 1. three-minute test
+sbatch slurm/train_slurm.sh configs/train.yaml                           # 2. the training
+```
+
+**Always run the smoke test first** after changing code, configs or the environment. It
+runs two tiny epochs (training → validation → training → validation) without logging and
+prints the memory it needed. Everything that can fail at an epoch boundary fails here in
+minutes instead of after an hour in the queue and an hour of training. The log must end with
+
+```
+SMOKE TEST PASSED
+[mem] peak N GB
+```
+
+Defaults: 1 GPU, 9 CPUs, 48 GB, 7 days, on whichever of `gpu4090`, `gpu3090`, `gpua100`
+has a free GPU first. One epoch of the full dataset takes about 1 hour on an RTX 4090.
+
+### What the log tells you
+
+| line | meaning |
+|---|---|
+| `repo ..., commit ...` | the code that ran |
+| `W&B: key found, logging online` | the key in `~/.wandb_key` was read (otherwise: offline, sync later) |
+| `metadata slimmed: 1.74 GB -> 0.22 GB per copy` | the metadata table kept for loading |
+| `[mem 12:00:00] 7.3 GB used (limit 49152 MB)` | program memory of the whole job, every 10 minutes |
+| `[mem] peak 7.9 GB` | the largest value seen, printed when the job ends |
+
+### Checkpoints and resuming
+
+Both files are in `checkpoints/seismogpt_v2/` (GRU: `checkpoints/gru_v2/`):
+
+| file | what | use |
+|---|---|---|
+| `best-epoch=E-step=S.ckpt` | lowest validation loss so far | evaluation |
+| `latest-epoch=E-step=S.ckpt` | the most recent epoch | resuming |
+
+```bash
+sbatch slurm/train_slurm.sh configs/train.yaml \
+       --ckpt_path "$(ls -t checkpoints/seismogpt_v2/latest-*.ckpt | head -1)"
+```
+
+### Memory: why the data loader uses `fork`
+
+Python 3.14 starts data-loading workers as fresh interpreters (`forkserver`). Each one then
+imports everything again and gets its own copy of the dataset: 1–2 GB per worker, and
+during validation the training and validation workers exist at the same time. With `fork`
+(`mp_context: fork` in the config) the workers share the memory of the training process;
+all of them together need well under 1 GB. If a job ever stalls with `fork`, fall back to
+`--data.mp_context forkserver --data.num_workers 4 --data.val_num_workers 2 --mem=64G`.
+
+### Two GPUs
+
+`--gres=gpu:2 --ntasks-per-node=2` (Lightning starts one process per SLURM task; the script
+stops if the two numbers differ). The effective batch size doubles, so results are not
+comparable with single-GPU runs at the same settings.

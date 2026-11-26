@@ -252,6 +252,12 @@ class SeismicWaveformDataset(Dataset):
         return segment, 1.0          # no signal in the anchor: leave unscaled
 
     def __getitem__(self, idx: int):
+        return self.get_item(idx, self.training)
+
+    def get_item(self, idx: int, training: bool):
+        """One window. `training` switches the training-only augmentations; it is an
+        argument (not only an attribute) so that the training and validation splits,
+        which share this object, cannot change each other's setting."""
         # Load full waveform [C, T_total]
         waveform = self.sb_dataset.get_waveforms(idx)
         n_channels, n_samples_total = waveform.shape
@@ -301,7 +307,7 @@ class SeismicWaveformDataset(Dataset):
         strain = torch.from_numpy(segment).float()*10
 
         # ── Training-only augmentations ───────────────────────────────────────
-        if self.training:
+        if training:
             # 1. Polarity flip — independently invert sign of each channel.
             #    Each channel is flipped with p=0.5, independently of the others.
             if self.aug_polarity_flip:
@@ -347,6 +353,23 @@ class SeismicWaveformDataset(Dataset):
         return out
 
 
+class SplitView(Dataset):
+    """One split (train / val / test) of a SeismicWaveformDataset, with its own
+    training flag. Before v2 the splits shared one flag on the dataset object, so
+    whichever dataloader was created last decided whether a worker augmented."""
+
+    def __init__(self, dataset: SeismicWaveformDataset, indices, training: bool):
+        self.dataset = dataset
+        self.indices = np.asarray(indices, dtype=np.int64)     # compact, cheap to share
+        self.training = bool(training)
+
+    def __len__(self) -> int:
+        return len(self.indices)
+
+    def __getitem__(self, i: int):
+        return self.dataset.get_item(int(self.indices[i]), self.training)
+
+
 class SeismicDataModule(LightningDataModule):
     """
     PyTorch Lightning DataModule for seismic waveform data with time modalities.
@@ -373,6 +396,14 @@ class SeismicDataModule(LightningDataModule):
         # fresh workers each epoch start clean, at the cost of a few seconds per epoch.
         persistent_workers: bool = False,
         slim_metadata: bool = True,       # training needs only a few columns (see dataset)
+        # Workers for validation/test (None: min(num_workers, 4)). During validation the
+        # training workers are still alive, so these come on top of them.
+        val_num_workers: int | None = None,
+        # How worker processes are started. "fork": workers share the parent's memory
+        # (imports, metadata) and start instantly. Python 3.14 changed the default to
+        # "forkserver": every worker is a fresh interpreter with its own copy of
+        # everything (1-2 GB each), which exhausted the job's memory. None = Python default.
+        mp_context: str | None = "fork",
     ):
         super().__init__()
         self.data_dir = data_dir
@@ -390,6 +421,8 @@ class SeismicDataModule(LightningDataModule):
         self.anchor_len = anchor_len
         self.persistent_workers = persistent_workers
         self.slim_metadata = slim_metadata
+        self.val_num_workers = min(num_workers, 4) if val_num_workers is None else val_num_workers
+        self.mp_context = mp_context
         self.save_hyperparameters()
 
     def setup(self, stage=None):
@@ -411,9 +444,25 @@ class SeismicDataModule(LightningDataModule):
         train_len = int(0.8 * len(self.full_dataset))
         val_len = int(0.1 * len(self.full_dataset))
         test_len = len(self.full_dataset) - train_len - val_len
-        self.train_dataset, self.val_dataset, self.test_dataset = random_split(
+        train, val, test = random_split(
             self.full_dataset, [train_len, val_len, test_len],
             generator=torch.Generator().manual_seed(42), # for reproducible train/val/test split
+        )
+        # same indices as before; each split now carries its own training flag
+        self.train_dataset = SplitView(self.full_dataset, train.indices, training=True)
+        self.val_dataset = SplitView(self.full_dataset, val.indices, training=False)
+        self.test_dataset = SplitView(self.full_dataset, test.indices, training=False)
+
+    def _loader(self, dataset, shuffle: bool, num_workers: int, collate: bool = True):
+        return DataLoader(
+            dataset,
+            batch_size=self.batch_size,
+            shuffle=shuffle,
+            num_workers=num_workers,
+            pin_memory=True,
+            persistent_workers=self.persistent_workers and num_workers > 0,
+            multiprocessing_context=self.mp_context if num_workers > 0 else None,
+            collate_fn=self._make_collate_fn() if collate else None,
         )
 
     def _make_collate_fn(self):
@@ -431,36 +480,11 @@ class SeismicDataModule(LightningDataModule):
 
 
     def train_dataloader(self):
-        self.train_dataset.dataset.set_training(True)
-        return DataLoader(
-            self.train_dataset,
-            batch_size=self.batch_size,
-            shuffle=True,
-            num_workers=self.num_workers,
-            pin_memory=True,
-            persistent_workers=self.persistent_workers and self.num_workers > 0,
-            collate_fn=self._make_collate_fn(),
-        )
+        return self._loader(self.train_dataset, shuffle=True, num_workers=self.num_workers)
 
     def val_dataloader(self):
-        self.val_dataset.dataset.set_training(False)
-        return DataLoader(
-            self.val_dataset,
-            batch_size=self.batch_size,
-            shuffle=False,
-            num_workers=self.num_workers,
-            pin_memory=True,
-            persistent_workers=self.persistent_workers and self.num_workers > 0,
-            collate_fn=self._make_collate_fn(),
-        )
+        return self._loader(self.val_dataset, shuffle=False, num_workers=self.val_num_workers)
 
     def test_dataloader(self):
-        self.test_dataset.dataset.set_training(False)
-        return DataLoader(
-            self.test_dataset,
-            batch_size=self.batch_size,
-            shuffle=False,
-            num_workers=self.num_workers,
-            pin_memory=True,
-            persistent_workers=self.persistent_workers and self.num_workers > 0,
-        )
+        return self._loader(self.test_dataset, shuffle=False, num_workers=self.val_num_workers,
+                            collate=False)

@@ -11,13 +11,25 @@ trainer:
   callbacks:
     - class_path: lightning.pytorch.callbacks.ModelCheckpoint
       init_args:
+        # the best model so far (lowest validation loss): the one that is evaluated.
+        # A fixed folder (not logs/version_N): a resumed run then keeps its record of the best.
+        dirpath: checkpoints/seismogpt_v2
+        filename: "best-{epoch}-{step}"
         save_weights_only: false
-        save_last: true
         mode: "min"
         monitor: "val_loss"
         every_n_train_steps: 0
         every_n_epochs: 1
         train_time_interval: null
+    - class_path: lightning.pytorch.callbacks.ModelCheckpoint
+      init_args:
+        # the most recent epoch, whether it improved or not: the one to RESUME from.
+        # (save_last only updates last.ckpt when the monitored loss improves.)
+        dirpath: checkpoints/seismogpt_v2
+        filename: "latest-{epoch}-{step}"
+        monitor: null
+        save_top_k: 1
+        every_n_epochs: 1
     - class_path: lightning.pytorch.callbacks.EarlyStopping
       init_args:
         monitor: "val_loss"
@@ -82,7 +94,12 @@ data:
     kernel_size: 16
     stride: 16
     batch_size: 32
-    num_workers: 16
+    num_workers: 8
+    # v2: memory-safe data loading (see data_handling.py)
+    val_num_workers: 4
+    mp_context: fork
+    persistent_workers: false
+    slim_metadata: true
     num_tokens: 320
     normalize: true
     random_shift: true
