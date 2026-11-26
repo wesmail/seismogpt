@@ -94,8 +94,9 @@ SMOKE TEST PASSED
 [mem] peak N GB
 ```
 
-Defaults: 1 GPU, 9 CPUs, 48 GB, 7 days, on whichever of `gpu4090`, `gpu3090`, `gpua100`
-has a free GPU first. One epoch of the full dataset takes about 1 hour on an RTX 4090.
+Defaults: 1 GPU, 9 CPUs, 48 GB, 7 days, on `gpu4090` or `gpu3090`, whichever has a free
+GPU first (the `gpua100` nodes fail with CUDA "busy or unavailable"). One epoch of the full
+dataset takes about 1 hour on an RTX 4090; the measured peak memory is about 7 GB.
 
 ### What the log tells you
 

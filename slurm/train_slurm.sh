@@ -1,6 +1,6 @@
 #!/bin/bash
 #SBATCH --job-name=seismogpt_train
-#SBATCH --partition=gpu4090,gpu3090,gpua100   # whichever has a free GPU first
+#SBATCH --partition=gpu4090,gpu3090   # not gpua100: its nodes fail with CUDA "busy or unavailable"
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1             # ONE PROCESS PER GPU: must equal the number of GPUs
 #SBATCH --cpus-per-task=9               # 8 data-loading workers + the training process
@@ -85,7 +85,8 @@ if [[ -n "${SMOKE:-}" ]]; then
     export WANDB_MODE=disabled
     ARGS+=(--trainer.max_epochs 2 --trainer.limit_train_batches "${SMOKE_TRAIN:-400}"
            --trainer.limit_val_batches "${SMOKE_VAL:-100}"
-           --trainer.logger false --trainer.default_root_dir "$SMOKE_DIR")
+           --trainer.logger false --trainer.default_root_dir "$SMOKE_DIR"
+           --trainer.callbacks "[]")       # default checkpoint only, inside $SMOKE_DIR
     echo "SMOKE TEST: 2 epochs x (${SMOKE_TRAIN:-400} training + ${SMOKE_VAL:-100} validation batches), output in $SMOKE_DIR"
 fi
 
