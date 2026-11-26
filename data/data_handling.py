@@ -346,6 +346,10 @@ class SeismicDataModule(LightningDataModule):
         aug_channel_swap: bool = False,
         norm_mode: str = "anchor",
         anchor_len: int | None = None,
+        # Keep data-loading workers alive between epochs? Default False since v2: the
+        # full dataset (3.9 M traces) made worker memory grow until the job was killed;
+        # fresh workers each epoch start clean, at the cost of a few seconds per epoch.
+        persistent_workers: bool = False,
     ):
         super().__init__()
         self.data_dir = data_dir
@@ -361,6 +365,7 @@ class SeismicDataModule(LightningDataModule):
         self.aug_channel_swap = aug_channel_swap
         self.norm_mode = norm_mode
         self.anchor_len = anchor_len
+        self.persistent_workers = persistent_workers
         self.save_hyperparameters()
 
     def setup(self, stage=None):
@@ -408,7 +413,7 @@ class SeismicDataModule(LightningDataModule):
             shuffle=True,
             num_workers=self.num_workers,
             pin_memory=True,
-            persistent_workers=self.num_workers > 0,
+            persistent_workers=self.persistent_workers and self.num_workers > 0,
             collate_fn=self._make_collate_fn(),
         )
 
@@ -420,7 +425,7 @@ class SeismicDataModule(LightningDataModule):
             shuffle=False,
             num_workers=self.num_workers,
             pin_memory=True,
-            persistent_workers=self.num_workers > 0,
+            persistent_workers=self.persistent_workers and self.num_workers > 0,
             collate_fn=self._make_collate_fn(),
         )
 
@@ -432,5 +437,5 @@ class SeismicDataModule(LightningDataModule):
             shuffle=False,
             num_workers=self.num_workers,
             pin_memory=True,
-            persistent_workers=self.num_workers > 0,
+            persistent_workers=self.persistent_workers and self.num_workers > 0,
         )
