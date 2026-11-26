@@ -21,7 +21,8 @@ def training_split(data_dir, n_items, seed=0, kernel_size=16, num_tokens=320):
     """
     dm = SeismicDataModule(data_dir=data_dir, kernel_size=kernel_size, stride=kernel_size,
                            num_tokens=num_tokens, normalize=True, random_shift=False,
-                           num_pred_horizons=1, norm_mode="anchor")
+                           num_pred_horizons=1, norm_mode="anchor",
+                           slim_metadata=False)     # the kNN index needs the source parameters
     dm.setup()
     train_idx = np.asarray(dm.train_dataset.indices)
     if n_items and n_items < len(train_idx):

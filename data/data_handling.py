@@ -144,6 +144,10 @@ class SeismicWaveformDataset(Dataset):
         aug_channel_swap: bool = False,
         norm_mode: str = "anchor",
         anchor_len: int | None = None,
+        # v2: keep only the metadata columns needed to load a window. Each data-loading
+        # worker holds its own copy of the metadata; with 3.9 M traces and all columns
+        # that is ~3.5 GB per worker, enough to exhaust the job's memory.
+        slim_metadata: bool = False,
     ):
         if sbd is None:
             raise ImportError("seisbench is required for SeismicWaveformDataset. Install with: pip install seisbench")
@@ -168,6 +172,8 @@ class SeismicWaveformDataset(Dataset):
         self.anchor_len = int(anchor_len) if anchor_len else self.kernel_size
         self._warned_zero_anchor = False
         self.sb_dataset = sbd.WaveformDataset(self.data_dir)
+        if slim_metadata:
+            self._slim_metadata()
         self.metadata = self.sb_dataset.metadata
 
         # context_size is for non-overlapping tokenization (stride==kernel_size typical)
@@ -177,6 +183,22 @@ class SeismicWaveformDataset(Dataset):
 
         print(f"SeismicWaveformDataset: loaded {len(self.metadata)} samples from {self.data_dir}")
         print(f"Waveform shape example: {self.sb_dataset.get_waveforms(0).shape}")
+
+    # columns read by SeisBench's get_waveforms and by __getitem__
+    _NEEDED = ("trace_name", "trace_chunk", "trace_sampling_rate_hz",
+               "trace_source_sampling_rate_hz", "trace_component_order",
+               "trace_p_arrival_s", "trace_s_arrival_s")
+
+    def _slim_metadata(self):
+        m = self.sb_dataset._metadata
+        before = m.memory_usage(deep=True).sum()
+        m = m[[c for c in self._NEEDED if c in m.columns]].copy()
+        for c in ("trace_chunk", "trace_component_order"):     # few distinct values
+            if c in m.columns:
+                m[c] = m[c].astype("category")
+        self.sb_dataset._metadata = m
+        after = m.memory_usage(deep=True).sum()
+        print(f"metadata slimmed: {before / 1e9:.2f} GB -> {after / 1e9:.2f} GB per copy")
 
     def set_training(self, training: bool):
         self.training = training
@@ -350,6 +372,7 @@ class SeismicDataModule(LightningDataModule):
         # full dataset (3.9 M traces) made worker memory grow until the job was killed;
         # fresh workers each epoch start clean, at the cost of a few seconds per epoch.
         persistent_workers: bool = False,
+        slim_metadata: bool = True,       # training needs only a few columns (see dataset)
     ):
         super().__init__()
         self.data_dir = data_dir
@@ -366,6 +389,7 @@ class SeismicDataModule(LightningDataModule):
         self.norm_mode = norm_mode
         self.anchor_len = anchor_len
         self.persistent_workers = persistent_workers
+        self.slim_metadata = slim_metadata
         self.save_hyperparameters()
 
     def setup(self, stage=None):
@@ -382,6 +406,7 @@ class SeismicDataModule(LightningDataModule):
             aug_channel_swap=self.aug_channel_swap,
             norm_mode=self.norm_mode,
             anchor_len=self.anchor_len,
+            slim_metadata=self.slim_metadata,
         )
         train_len = int(0.8 * len(self.full_dataset))
         val_len = int(0.1 * len(self.full_dataset))
